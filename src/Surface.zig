@@ -520,6 +520,11 @@ pub fn init(
     // Initialize our renderer with our initialized surface.
     try Renderer.surfaceInit(rt_surface);
 
+    const initial_focused = if (comptime @hasDecl(apprt.runtime.Surface, "initialFocused"))
+        rt_surface.initialFocused()
+    else
+        true;
+
     // Determine our DPI configurations so we can properly configure
     // font points to pixels and handle other high-DPI scaling factors.
     const content_scale = try rt_surface.getContentScale();
@@ -601,6 +606,7 @@ pub fn init(
         app_mailbox,
     );
     errdefer render_thread.deinit();
+    render_thread.flags.focused = initial_focused;
 
     // Create the IO thread
     var io_thread = try termio.Thread.init(alloc);
@@ -636,6 +642,7 @@ pub fn init(
         .io_thr = undefined,
         .size = size,
         .config = derived_config,
+        .focused = initial_focused,
 
         // Our conditional state is initialized to the app state. This
         // lets us get the most likely correct color theme and so on.
@@ -734,6 +741,11 @@ pub fn init(
     // Outside the block, IO has now taken ownership of our temporary state
     // so we can just defer this and not the subcomponents.
     errdefer self.io.deinit();
+
+    // Seed the terminal focus state before the IO thread starts so DECSET
+    // 1004 observes the actual initial focus without requiring a synthetic
+    // focus callback.
+    self.io.terminal.flags.focused = self.focused;
 
     // Report initial cell size on surface creation
     _ = try rt_app.performAction(

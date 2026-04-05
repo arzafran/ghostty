@@ -609,6 +609,9 @@ extension Ghostty {
     /// The configuration for a surface. For any configuration not set, defaults will be chosen from
     /// libghostty, usually from the Ghostty configuration.
     struct SurfaceConfiguration {
+        /// Initial focused state for the created surface.
+        var focused: Bool = true
+
         /// Explicit font size to use in points
         var fontSize: Float32?
 
@@ -638,6 +641,7 @@ extension Ghostty {
         init() {}
 
         init(from config: ghostty_surface_config_s) {
+            self.focused = config.focused
             self.fontSize = config.font_size
             if let workingDirectory = config.working_directory {
                 self.workingDirectory = String.init(cString: workingDirectory, encoding: .utf8)
@@ -683,6 +687,8 @@ extension Ghostty {
 #else
 #error("unsupported target")
 #endif
+
+            config.focused = focused
 
             // Zero is our default value that means to inherit the font size.
             config.font_size = fontSize ?? 0

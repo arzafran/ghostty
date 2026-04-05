@@ -830,9 +830,12 @@ pub const StreamHandler = struct {
                 .size_report = .mode_2048,
             }),
 
-            .focus_event => if (enabled) self.messageWriter(.{
-                .focused = self.terminal.flags.focused,
-            }),
+            // xterm-compatible focus reporting only emits on subsequent focus
+            // transitions. Do not synthesize an immediate state report when the
+            // mode is enabled, otherwise applications that toggle DECSET 1004
+            // during startup receive spurious CSI I/O without any real focus
+            // change having happened.
+            .focus_event => {},
 
             .mouse_event_x10 => {
                 if (enabled) {
@@ -1698,4 +1701,51 @@ test "tmux control pane output payload keeps bounded suffix" {
     try std.testing.expectEqual(@as(u8, 'a'), capped[0]);
     try std.testing.expectEqual(@as(u8, '!'), capped[capped.len - 1]);
     try std.testing.expect(!std.mem.containsAtLeast(u8, capped, 1, "xyz"));
+||||||| parent of c19c82bfd (Seed initial focus state and avoid startup focus-report leak)
+test "enabling focus reporting does not emit an immediate focus sequence" {
+    const testing = std.testing;
+
+    var term = try terminal.Terminal.init(testing.allocator, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer term.deinit(testing.allocator);
+
+    var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    defer mailbox.deinit(testing.allocator);
+
+    var mutex: std.Thread.Mutex = .{};
+    var renderer_state: renderer.State = .{
+        .mutex = &mutex,
+        .terminal = &term,
+    };
+    var size: renderer.Size = .{
+        .screen = .{ .width = 800, .height = 600 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{},
+    };
+    var handler = StreamHandler{
+        .alloc = testing.allocator,
+        .size = &size,
+        .terminal = &term,
+        .termio_mailbox = &mailbox,
+        .surface_mailbox = undefined,
+        .renderer_state = &renderer_state,
+        .renderer_mailbox = undefined,
+        .renderer_wakeup = undefined,
+        .default_cursor_style = .block,
+        .default_cursor_blink = null,
+        .enquiry_response = "",
+        .osc_color_report_format = .none,
+        .clipboard_write = .deny,
+    };
+    defer handler.deinit();
+
+    mutex.lock();
+    defer mutex.unlock();
+    try handler.setMode(.focus_event, true);
+
+    try testing.expect(term.modes.get(.focus_event));
+    try testing.expect(!handler.termio_messaged);
+    try testing.expect(mailbox.spsc.queue.pop() == null);
 }
