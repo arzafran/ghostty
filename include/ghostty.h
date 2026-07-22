@@ -473,6 +473,19 @@ typedef enum {
 
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
 
+// Called with a copy of every raw PTY output slice as it is processed,
+// for as long as a tap is registered via ghostty_surface_set_output_tap.
+// The callback runs on whatever thread is currently processing PTY
+// output (typically the surface's dedicated io-reader thread) with the
+// surface's internal renderer state lock already held. It MUST be
+// cheap: copy the bytes out (they are only valid for the duration of
+// the call) and return immediately. Do not call back into any
+// ghostty_surface_* function that may take the same lock, do not
+// allocate, and do not block.
+typedef void (*ghostty_surface_output_tap_cb)(const uint8_t* buf,
+                                              uintptr_t len,
+                                              void* userdata);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -1239,6 +1252,70 @@ GHOSTTY_API bool ghostty_surface_read_screen_clipboard_text(ghostty_surface_t,
                                                             uintptr_t,
                                                             ghostty_text_s*);
 GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+ghostty_surface_t ghostty_surface_new(ghostty_app_t,
+                                      const ghostty_surface_config_s*);
+void ghostty_surface_free(ghostty_surface_t);
+void* ghostty_surface_userdata(ghostty_surface_t);
+ghostty_app_t ghostty_surface_app(ghostty_surface_t);
+ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
+void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
+bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
+bool ghostty_surface_process_exited(ghostty_surface_t);
+void ghostty_surface_refresh(ghostty_surface_t);
+void ghostty_surface_draw(ghostty_surface_t);
+void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
+void ghostty_surface_set_focus(ghostty_surface_t, bool);
+void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+void ghostty_surface_set_color_scheme(ghostty_surface_t,
+                                      ghostty_color_scheme_e);
+ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
+                                                          ghostty_input_mods_e);
+bool ghostty_surface_key(ghostty_surface_t, ghostty_input_key_s);
+bool ghostty_surface_key_is_binding(ghostty_surface_t,
+                                    ghostty_input_key_s,
+                                    ghostty_binding_flags_e*);
+void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
+void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
+void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
+void ghostty_surface_set_output_tap(ghostty_surface_t,
+                                    ghostty_surface_output_tap_cb,
+                                    void*);
+bool ghostty_surface_mouse_captured(ghostty_surface_t);
+bool ghostty_surface_mouse_button(ghostty_surface_t,
+                                  ghostty_input_mouse_state_e,
+                                  ghostty_input_mouse_button_e,
+                                  ghostty_input_mods_e);
+void ghostty_surface_mouse_pos(ghostty_surface_t,
+                               double,
+                               double,
+                               ghostty_input_mods_e);
+void ghostty_surface_mouse_scroll(ghostty_surface_t,
+                                  double,
+                                  double,
+                                  ghostty_input_scroll_mods_t);
+void ghostty_surface_mouse_pressure(ghostty_surface_t, uint32_t, double);
+void ghostty_surface_ime_point(ghostty_surface_t, double*, double*, double*, double*);
+void ghostty_surface_request_close(ghostty_surface_t);
+void ghostty_surface_split(ghostty_surface_t, ghostty_action_split_direction_e);
+void ghostty_surface_split_focus(ghostty_surface_t,
+                                 ghostty_action_goto_split_e);
+void ghostty_surface_split_resize(ghostty_surface_t,
+                                  ghostty_action_resize_split_direction_e,
+                                  uint16_t);
+void ghostty_surface_split_equalize(ghostty_surface_t);
+bool ghostty_surface_binding_action(ghostty_surface_t, const char*, uintptr_t);
+void ghostty_surface_complete_clipboard_request(ghostty_surface_t,
+                                                const char*,
+                                                void*,
+                                                bool);
+bool ghostty_surface_has_selection(ghostty_surface_t);
+bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
+bool ghostty_surface_read_text(ghostty_surface_t,
+                               ghostty_selection_s,
+                               ghostty_text_s*);
+void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 
 #ifdef __APPLE__
 GHOSTTY_API void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);
