@@ -707,6 +707,14 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         log.warn("failed to get current time err={}", .{err});
     }
 
+    // If a caller has registered an output tap, hand it the raw slice
+    // exactly once (never per-byte) before we process it. This runs
+    // under the renderer_state mutex we're already holding; the tap
+    // callback must be cheap (see OutputTap doc comment).
+    if (self.renderer_state.output_tap) |tap| {
+        tap.callback(buf.ptr, buf.len, tap.userdata);
+    }
+
     // If we have an inspector, we enter SLOW MODE because we need to
     // process a byte at a time alternating between the inspector handler
     // and the termio handler. This is very slow compared to our optimizations

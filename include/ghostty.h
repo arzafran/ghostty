@@ -444,6 +444,19 @@ typedef enum {
 
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
 
+// Called with a copy of every raw PTY output slice as it is processed,
+// for as long as a tap is registered via ghostty_surface_set_output_tap.
+// The callback runs on whatever thread is currently processing PTY
+// output (typically the surface's dedicated io-reader thread) with the
+// surface's internal renderer state lock already held. It MUST be
+// cheap: copy the bytes out (they are only valid for the duration of
+// the call) and return immediately. Do not call back into any
+// ghostty_surface_* function that may take the same lock, do not
+// allocate, and do not block.
+typedef void (*ghostty_surface_output_tap_cb)(const uint8_t* buf,
+                                              uintptr_t len,
+                                              void* userdata);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -1101,6 +1114,9 @@ bool ghostty_surface_key_is_binding(ghostty_surface_t,
 void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
 void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
+void ghostty_surface_set_output_tap(ghostty_surface_t,
+                                    ghostty_surface_output_tap_cb,
+                                    void*);
 bool ghostty_surface_mouse_captured(ghostty_surface_t);
 bool ghostty_surface_mouse_button(ghostty_surface_t,
                                   ghostty_input_mouse_state_e,

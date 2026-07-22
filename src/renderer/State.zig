@@ -20,6 +20,13 @@ terminal: *terminalpkg.Terminal,
 /// is not active and will be set when it is active.
 inspector: ?*Inspector = null,
 
+/// An optional tap that receives a copy of every raw PTY output slice
+/// as it is processed. Null when no tap is registered (the default),
+/// in which case processing this field costs a single nullable check.
+/// See `OutputTap` for the threading/safety contract callers must
+/// follow.
+output_tap: ?OutputTap = null,
+
 /// Dead key state. This will render the current dead key preedit text
 /// over the cursor. This currently only ever renders a single codepoint.
 /// Preedit can in theory be multiple codepoints long but that is left as
@@ -40,6 +47,22 @@ pub const Mouse = struct {
     /// This could really just be mods in general and we probably will
     /// move it out of mouse state at some point.
     mods: inputpkg.Mods = .{},
+};
+
+/// A registered raw PTY output tap. See `output_tap` above.
+///
+/// Threading/safety contract: the callback is invoked from whichever
+/// thread is currently processing PTY output (typically the surface's
+/// dedicated io-reader thread) while `mutex` is already held by the
+/// caller. The callback MUST be cheap: copy the bytes out (they are
+/// only valid for the duration of the call) and return. Do not lock
+/// any mutex that could be held while this state's `mutex` is being
+/// acquired elsewhere, do not allocate, and do not block.
+pub const OutputTap = struct {
+    pub const Callback = *const fn (buf: [*]const u8, len: usize, userdata: ?*anyopaque) callconv(.c) void;
+
+    callback: Callback,
+    userdata: ?*anyopaque = null,
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.

@@ -1884,6 +1884,28 @@ pub const CAPI = struct {
         surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
+    /// Register (or clear, with cb == null) a tap that receives a copy
+    /// of every raw PTY output slice as it is processed by this surface.
+    /// See `renderer.State.OutputTap` for the threading/safety contract
+    /// the callback must follow: it runs on whatever thread is currently
+    /// processing PTY output (typically the surface's io-reader thread)
+    /// with the renderer state mutex already held, so it must be cheap
+    /// (copy-out only, no locks, no allocation, no blocking).
+    export fn ghostty_surface_set_output_tap(
+        surface: *Surface,
+        cb: ?renderer.State.OutputTap.Callback,
+        userdata: ?*anyopaque,
+    ) void {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+
+        core_surface.renderer_state.output_tap = if (cb) |f|
+            .{ .callback = f, .userdata = userdata }
+        else
+            null;
+    }
+
     /// Returns true if the surface currently has mouse capturing
     /// enabled.
     export fn ghostty_surface_mouse_captured(surface: *Surface) bool {
