@@ -1687,7 +1687,11 @@ pub const CAPI = struct {
         };
         const pty = exec.subprocess.pty orelse return false;
 
-        return ttyname_r(@intCast(pty.slave), buf, buf_len) == 0;
+        // Resolve from the master, not the slave: the parent closes its
+        // slave fd right after spawning the child (see termio/Exec.zig),
+        // so ttyname_r on it would fail with EBADF once a child is
+        // running, which is exactly when callers want this.
+        return ptsname_r(@intCast(pty.master), buf, buf_len) == 0;
     }
 
     /// Returns the raw pty master file descriptor for the surface, or
@@ -1711,10 +1715,12 @@ pub const CAPI = struct {
         return @intCast(pty.master);
     }
 
-    /// Used by ghostty_surface_pty_path to resolve the slave device
     /// path from its fd. Ghostty doesn't retain this path itself since
     /// upstream has no need for it.
-    extern "c" fn ttyname_r(fd: c_int, buf: [*]u8, buflen: usize) c_int;
+    /// Resolves the slave device path from a pty master fd. Used
+    /// instead of ttyname_r because the parent closes its slave fd
+    /// after spawning the child.
+    extern "c" fn ptsname_r(fd: c_int, buf: [*]u8, buflen: usize) c_int;
 
     /// Returns true if the surface has a selection.
     export fn ghostty_surface_has_selection(surface: *Surface) bool {
