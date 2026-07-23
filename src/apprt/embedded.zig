@@ -1642,6 +1642,80 @@ pub const CAPI = struct {
         return surface.core_surface.child_exited;
     }
 
+    /// Returns the pid of the surface's spawned child process, or -1
+    /// if there is none (not yet spawned, already exited, or this
+    /// surface's backend has no subprocess, e.g. a manual/output-only
+    /// surface or a flatpak host command).
+    export fn ghostty_surface_child_pid(surface: *Surface) i64 {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+
+        const exec = switch (core_surface.io.backend) {
+            .exec => |*e| e,
+            .manual => return -1,
+        };
+        const process = if (exec.subprocess.process) |*p| p else return -1;
+        return switch (process.*) {
+            .fork_exec => |*cmd| if (cmd.pid) |pid| @intCast(pid) else -1,
+            // Flatpak host commands track their pid behind a separate
+            // state mutex we don't want to nest under renderer_state's
+            // lock here, so treat as unavailable.
+            .flatpak => -1,
+        };
+    }
+
+    /// Writes the pty slave device path (e.g. "/dev/ttys004") for the
+    /// surface as a NUL-terminated string into the caller-provided
+    /// buffer. Returns false (leaving buf untouched) if the surface
+    /// has no pty yet, or if buf_len is too small.
+    export fn ghostty_surface_pty_path(
+        surface: *Surface,
+        buf: [*]u8,
+        buf_len: usize,
+    ) bool {
+        if (comptime builtin.target.os.tag == .windows) return false;
+        if (buf_len == 0) return false;
+
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+
+        const exec = switch (core_surface.io.backend) {
+            .exec => |*e| e,
+            .manual => return false,
+        };
+        const pty = exec.subprocess.pty orelse return false;
+
+        return ttyname_r(@intCast(pty.slave), buf, buf_len) == 0;
+    }
+
+    /// Returns the raw pty master file descriptor for the surface, or
+    /// -1 if unavailable. This does NOT dup, close, or otherwise
+    /// transfer ownership -- ghostty keeps owning the fd and its
+    /// lifetime, which is tied to the surface's subprocess. The caller
+    /// must dup() it before doing anything that outlives the surface
+    /// (e.g. handing it to another process).
+    export fn ghostty_surface_pty_master_fd(surface: *Surface) c_int {
+        if (comptime builtin.target.os.tag == .windows) return -1;
+
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+
+        const exec = switch (core_surface.io.backend) {
+            .exec => |*e| e,
+            .manual => return -1,
+        };
+        const pty = exec.subprocess.pty orelse return -1;
+        return @intCast(pty.master);
+    }
+
+    /// Used by ghostty_surface_pty_path to resolve the slave device
+    /// path from its fd. Ghostty doesn't retain this path itself since
+    /// upstream has no need for it.
+    extern "c" fn ttyname_r(fd: c_int, buf: [*]u8, buflen: usize) c_int;
+
     /// Returns true if the surface has a selection.
     export fn ghostty_surface_has_selection(surface: *Surface) bool {
         return surface.core_surface.hasSelection();

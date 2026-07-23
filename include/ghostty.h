@@ -1096,6 +1096,27 @@ ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, gho
 void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
 bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 bool ghostty_surface_process_exited(ghostty_surface_t);
+
+// Read-only accessors for the surface's spawned child process and pty.
+// Safe to call at any time, including before the child has spawned or
+// after it has exited -- they return the documented sentinel rather
+// than trapping in those cases.
+
+// Returns the pid of the surface's spawned child process, or -1 if
+// there is none (not yet spawned, already exited, or this surface's
+// backend has no subprocess).
+int64_t ghostty_surface_child_pid(ghostty_surface_t);
+// Writes the pty slave device path (e.g. "/dev/ttys004") as a
+// NUL-terminated string into buf. Returns false if unavailable, or if
+// buf_len is too small to hold the path plus the NUL terminator; buf
+// is left untouched in that case.
+bool ghostty_surface_pty_path(ghostty_surface_t, char* buf, uintptr_t buf_len);
+// Returns the raw pty master file descriptor, or -1 if unavailable.
+// This does NOT dup, close, or otherwise transfer ownership -- ghostty
+// keeps owning the fd and its lifetime, which is tied to the surface's
+// subprocess. The caller must dup() it before doing anything that
+// outlives the surface (e.g. handing it to another process).
+int ghostty_surface_pty_master_fd(ghostty_surface_t);
 void ghostty_surface_refresh(ghostty_surface_t);
 void ghostty_surface_draw(ghostty_surface_t);
 void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
