@@ -112,6 +112,11 @@ pub fn threadEnter(
         // as a special case in os/flatpak.zig) since the
         // command is on the host.
         .flatpak => null,
+
+        // A revived process we didn't fork. kqueue EVFILT_PROC/NOTE_EXIT
+        // (which xev.Process uses on macOS) fires for exit of any pid,
+        // not just our own children, so this works the same as fork_exec.
+        .attached => |a| try xev.Process.init(a.pid),
     } else return error.ProcessNotStarted;
     errdefer if (process) |*p| p.deinit();
 
@@ -173,6 +178,7 @@ pub fn threadEnter(
             ),
 
             .fork_exec => {},
+            .attached => {},
         }
     }
 
@@ -569,6 +575,15 @@ pub const Config = struct {
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
+
+    /// If set, we don't spawn a new subprocess. Instead we attach to an
+    /// already-running child process via this master pty fd (owned by
+    /// the caller, who is expected to have dup'd it for us) and watch
+    /// `revive_pid` for exit. This is used to reattach to a terminal
+    /// process that survived across an app relaunch. Not supported on
+    /// Windows.
+    revive_fd: ?posix.fd_t = null,
+    revive_pid: ?posix.pid_t = null,
 };
 
 const Subprocess = struct {
@@ -590,6 +605,11 @@ const Subprocess = struct {
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
 
+    /// Revival attachment info. See Config.revive_fd for details. Only
+    /// honored on POSIX; ignored (stays null) on Windows.
+    revive_fd: ?posix.fd_t = null,
+    revive_pid: ?posix.pid_t = null,
+
     /// Union that represents the running process type.
     const Process = union(enum) {
         /// Standard POSIX fork/exec
@@ -597,6 +617,12 @@ const Subprocess = struct {
 
         /// Flatpak DBus command
         flatpak: FlatpakHostCommand,
+
+        /// A process we did not fork ourselves. We're only watching
+        /// `pid` for exit (via xev.Process/kqueue) and reading/writing
+        /// its pty master fd. We must never signal it as an owner would
+        /// (no SIGHUP/killpg on stop, no waitpid).
+        attached: struct { pid: posix.pid_t },
     };
 
     const ArgsFormatter = struct {
@@ -617,6 +643,30 @@ const Subprocess = struct {
         // so use an arena so we don't end up in an accounting nightmare.
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
+
+        // Revival: attach to an already-running child instead of
+        // spawning. Skip all spawn-time setup below (env building,
+        // shell integration, arg construction) since none of it
+        // applies to a process that's already running.
+        if (comptime builtin.os.tag != .windows) {
+            if (cfg.revive_fd) |fd| {
+                var revive_env = cfg.env;
+                revive_env.deinit();
+                return .{
+                    .arena = arena,
+                    .env = null,
+                    .cwd = null,
+                    .args = &.{},
+                    .grid_size = .{},
+                    .screen_size = .{ .width = 1, .height = 1 },
+                    .rt_pre_exec_info = cfg.rt_pre_exec_info,
+                    .rt_post_fork_info = cfg.rt_post_fork_info,
+                    .revive_fd = fd,
+                    .revive_pid = cfg.revive_pid,
+                };
+            }
+        }
+
         const alloc = arena.allocator();
 
         // Get our env. If a default env isn't provided by the caller
@@ -887,6 +937,20 @@ const Subprocess = struct {
     } {
         assert(self.pty == null and self.process == null);
 
+        // Revival: attach to the already-running child's pty master
+        // fd and pid instead of opening a new pty and forking. The
+        // slave side was already closed by the original parent; we
+        // never touch it (setSize/getSize/getMode only use master).
+        if (comptime builtin.os.tag != .windows) {
+            if (self.revive_fd) |fd| {
+                const pid = self.revive_pid orelse return error.ReviveMissingPid;
+                self.pty = .{ .master = fd, .slave = -1 };
+                self.process = .{ .attached = .{ .pid = pid } };
+                log.info("attached to revived subcommand fd={} pid={}", .{ fd, pid });
+                return .{ .read = fd, .write = fd };
+            }
+        }
+
         // This function is funny because on POSIX systems it can
         // fail in the forked process. This is flipped to true if
         // we're in an error state in the forked process (child
@@ -1101,6 +1165,14 @@ const Subprocess = struct {
                 _ = cmd.wait() catch |err|
                     log.err("error waiting for command to exit: {}", .{err});
             },
+
+            // We never forked this process, so we don't own it. Do not
+            // signal it or wait on it as if it were a child; just stop
+            // watching. The caller (embedder) owns its lifecycle.
+            .attached => |a| log.info(
+                "detaching from revived subcommand pid={}, not signaling",
+                .{a.pid},
+            ),
         }
 
         self.process = null;

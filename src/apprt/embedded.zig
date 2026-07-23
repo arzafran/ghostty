@@ -424,6 +424,8 @@ pub const Surface = struct {
     io_mode: IoMode = .exec,
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
+    revive_pty_fd: c_int = -1,
+    revive_child_pid: i64 = -1,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -484,6 +486,17 @@ pub const Surface = struct {
 
         /// Userdata passed to io_write_cb.
         io_write_userdata: ?*anyopaque = null,
+
+        /// Revival: attach to an already-running child process instead
+        /// of spawning a new one. `revive_pty_fd` is the master pty fd
+        /// of the running child (caller-owned; ghostty will read/write
+        /// it and detect exit, but does not take ownership of the fd
+        /// beyond that). -1 means "not a revival, spawn normally".
+        /// `revive_child_pid` is the pid of the already-running child;
+        /// ignored unless `revive_pty_fd` is set. Not supported on
+        /// Windows.
+        revive_pty_fd: c_int = -1,
+        revive_child_pid: i64 = -1,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -502,6 +515,8 @@ pub const Surface = struct {
             .io_mode = opts.io_mode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
+            .revive_pty_fd = opts.revive_pty_fd,
+            .revive_child_pid = opts.revive_child_pid,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -670,6 +685,22 @@ pub const Surface = struct {
 
     pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {
         return self.io_write_userdata;
+    }
+
+    /// Revival: the pty master fd to attach to, if this surface was
+    /// created to revive an already-running child. Not supported on
+    /// Windows (comptime no-op there; Options field is still accepted
+    /// but ignored).
+    pub fn revivePtyFd(self: *const Surface) ?std.posix.fd_t {
+        if (comptime builtin.os.tag == .windows) return null;
+        return if (self.revive_pty_fd >= 0) self.revive_pty_fd else null;
+    }
+
+    /// Revival: the pid of the already-running child to watch for exit.
+    /// Only meaningful when revivePtyFd() is non-null.
+    pub fn reviveChildPid(self: *const Surface) ?std.posix.pid_t {
+        if (comptime builtin.os.tag == .windows) return null;
+        return if (self.revive_child_pid >= 0) @intCast(self.revive_child_pid) else null;
     }
 
     pub fn close(self: *const Surface, process_alive: bool) void {
@@ -1662,6 +1693,8 @@ pub const CAPI = struct {
             // state mutex we don't want to nest under renderer_state's
             // lock here, so treat as unavailable.
             .flatpak => -1,
+            // A revived surface attached to an already-running child.
+            .attached => |a| @intCast(a.pid),
         };
     }
 

@@ -474,6 +474,15 @@ typedef struct {
   ghostty_surface_io_mode_e io_mode;
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
+  // Revival: attach to an already-running child process's pty instead
+  // of spawning a new one. revive_pty_fd is the child's master pty fd,
+  // dup'd by the caller (ghostty reads/writes it and detects the
+  // child's exit but does not otherwise take ownership of it). -1
+  // means "not a revival, spawn normally" (the default). When set,
+  // revive_child_pid must also be set to the pid of the running child.
+  // Not supported on Windows.
+  int revive_pty_fd;
+  int64_t revive_child_pid;
 } ghostty_surface_config_s;
 
 typedef struct {
