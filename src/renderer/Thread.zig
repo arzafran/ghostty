@@ -363,6 +363,24 @@ fn drainMailbox(self: *Thread) !void {
                 // Notify the renderer so it can update any state.
                 self.renderer.setVisible(v);
 
+                // On the occluded-to-visible transition, force a full
+                // rebuild on the next updateFrame call. We skip updateFrame
+                // entirely while occluded (see renderCallback below) so
+                // that busy-but-hidden surfaces don't pay full frame-
+                // generation cost on every PTY output burst. The terminal-
+                // side dirty tracking that updateFrame consumes is level-
+                // triggered, not edge-triggered (it accumulates until a
+                // call consumes it, and dimension/viewport changes are
+                // detected by direct snapshot comparison), so this dirty
+                // forcing isn't strictly required for correctness -- but it
+                // costs only one extra frame of work at exactly the moment
+                // visibility changes, and it immunizes us against any
+                // renderer-side cache staleness class that dirty tracking
+                // doesn't cover. This wakeup callback will call
+                // renderCallback immediately after drainMailbox returns, so
+                // no separate render needs to be scheduled here.
+                if (v) self.renderer.markDirty();
+
                 // Note that we're explicitly today not stopping any
                 // cursor timers, draw timers, etc. These things have very
                 // little resource cost and properly maintaining their active
@@ -601,12 +619,25 @@ fn renderCallback(
         return .disarm;
     };
 
-    // Update our frame data
-    t.renderer.updateFrame(
-        t.state,
-        t.flags.cursor_blink_visible,
-    ) catch |err|
-        log.warn("error rendering err={}", .{err});
+    // Skip frame generation while fully occluded. `updateFrame` locks the
+    // terminal mutex and rebuilds render state on every call -- this fires
+    // on every PTY output burst (wakeupCallback calls us unconditionally),
+    // so for a hidden-but-busy surface this is the dominant idle-CPU cost.
+    // `drawFrame` below is already a no-op while invisible; skipping
+    // `updateFrame` too avoids the mutex lock, dirty-tracking consumption,
+    // and cell rebuild entirely.
+    //
+    // This is safe to skip: see the `.visible` case in drainMailbox above
+    // for why the next updateFrame call (forced immediately on becoming
+    // visible again) will correctly reflect everything that changed while
+    // we were skipping updates, including resizes.
+    if (t.flags.visible) {
+        t.renderer.updateFrame(
+            t.state,
+            t.flags.cursor_blink_visible,
+        ) catch |err|
+            log.warn("error rendering err={}", .{err});
+    }
 
     // Draw
     t.drawFrame(false);
