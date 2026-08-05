@@ -19,6 +19,20 @@ const log = std.log.scoped(.renderer_thread);
 const DRAW_INTERVAL = 8; // 120 FPS
 const CURSOR_BLINK_INTERVAL = 600;
 
+/// Minimum time between `updateFrame` calls while a surface is occluded,
+/// in milliseconds. See the throttle in `renderCallback` for why this
+/// exists instead of skipping `updateFrame` entirely while occluded.
+///
+/// PTY-burst wakeups for a busy hidden surface can arrive at 60-120Hz.
+/// Throttling those to 4Hz (250ms) is a ~95-98% reduction in frame-
+/// generation work for hidden-but-busy surfaces -- nearly all of the win
+/// of skipping updateFrame outright -- while still guaranteeing that
+/// anything which depends on periodic updateFrame calls (the scrollbar
+/// dirty/clear handshake, terminal_state refresh, dirty-tracking
+/// consumption read by `ghostty_surface_read_text`) keeps making forward
+/// progress instead of stalling indefinitely.
+const OCCLUDED_UPDATE_INTERVAL_MS = 250;
+
 /// Whether calls to `drawFrame` must be done from the app thread.
 ///
 /// If this is `true` then we send a `redraw_surface` message to the apprt
@@ -108,6 +122,13 @@ flags: packed struct {
     /// and it is up to the apprt to set the correct value.
     focused: bool = true,
 } = .{},
+
+/// Monotonic timestamp of the last `updateFrame` call made while occluded,
+/// used to throttle occluded updates to `OCCLUDED_UPDATE_INTERVAL_MS`. This
+/// is reset to `null` whenever the surface becomes occluded so that the
+/// first occluded update fires immediately rather than waiting a full
+/// interval. See `renderCallback`.
+last_occluded_update: ?std.time.Instant = null,
 
 pub const DerivedConfig = struct {
     custom_shader_animation: configpkg.CustomShaderAnimation,
@@ -363,23 +384,33 @@ fn drainMailbox(self: *Thread) !void {
                 // Notify the renderer so it can update any state.
                 self.renderer.setVisible(v);
 
-                // On the occluded-to-visible transition, force a full
-                // rebuild on the next updateFrame call. We skip updateFrame
-                // entirely while occluded (see renderCallback below) so
-                // that busy-but-hidden surfaces don't pay full frame-
-                // generation cost on every PTY output burst. The terminal-
-                // side dirty tracking that updateFrame consumes is level-
-                // triggered, not edge-triggered (it accumulates until a
-                // call consumes it, and dimension/viewport changes are
-                // detected by direct snapshot comparison), so this dirty
-                // forcing isn't strictly required for correctness -- but it
-                // costs only one extra frame of work at exactly the moment
-                // visibility changes, and it immunizes us against any
-                // renderer-side cache staleness class that dirty tracking
-                // doesn't cover. This wakeup callback will call
-                // renderCallback immediately after drainMailbox returns, so
-                // no separate render needs to be scheduled here.
-                if (v) self.renderer.markDirty();
+                if (v) {
+                    // On the occluded-to-visible transition, force a full
+                    // rebuild on the next updateFrame call. While occluded
+                    // we throttle updateFrame down to
+                    // OCCLUDED_UPDATE_INTERVAL_MS instead of calling it on
+                    // every wakeup (see renderCallback below), so a busy
+                    // hidden surface can be up to that interval stale when
+                    // it becomes visible again. The terminal-side dirty
+                    // tracking that updateFrame consumes is level-triggered,
+                    // not edge-triggered (it accumulates until a call
+                    // consumes it, and dimension/viewport changes are
+                    // detected by direct snapshot comparison), so this dirty
+                    // forcing isn't strictly required for correctness -- but
+                    // it costs only one extra frame of work at exactly the
+                    // moment visibility changes, and it immunizes us against
+                    // any renderer-side cache staleness class that dirty
+                    // tracking doesn't cover. This wakeup callback will call
+                    // renderCallback immediately after drainMailbox returns,
+                    // so no separate render needs to be scheduled here.
+                    self.renderer.markDirty();
+                } else {
+                    // Reset the occluded-update throttle so the first
+                    // updateFrame call after becoming occluded runs
+                    // immediately instead of waiting a full
+                    // OCCLUDED_UPDATE_INTERVAL_MS.
+                    self.last_occluded_update = null;
+                }
 
                 // Note that we're explicitly today not stopping any
                 // cursor timers, draw timers, etc. These things have very
@@ -619,24 +650,48 @@ fn renderCallback(
         return .disarm;
     };
 
-    // Skip frame generation while fully occluded. `updateFrame` locks the
-    // terminal mutex and rebuilds render state on every call -- this fires
-    // on every PTY output burst (wakeupCallback calls us unconditionally),
-    // so for a hidden-but-busy surface this is the dominant idle-CPU cost.
-    // `drawFrame` below is already a no-op while invisible; skipping
-    // `updateFrame` too avoids the mutex lock, dirty-tracking consumption,
-    // and cell rebuild entirely.
+    // Throttle (do not skip) frame generation while fully occluded.
+    // `updateFrame` locks the terminal mutex and rebuilds render state on
+    // every call -- this fires on every PTY output burst (wakeupCallback
+    // calls us unconditionally), so for a hidden-but-busy surface this is
+    // the dominant idle-CPU cost. `drawFrame` below is already a no-op
+    // while invisible.
     //
-    // This is safe to skip: see the `.visible` case in drainMailbox above
-    // for why the next updateFrame call (forced immediately on becoming
-    // visible again) will correctly reflect everything that changed while
-    // we were skipping updates, including resizes.
-    if (t.flags.visible) {
+    // We previously skipped `updateFrame` entirely while occluded, but that
+    // broke things that only make progress inside `updateFrame`: most
+    // notably, `scrollbar_dirty` is set in `updateFrame` (generic.zig) but
+    // only cleared in `drawFrame` (which is *also* gated off while
+    // invisible), so a hard skip leaves that handshake with no live half.
+    // In CI, where every surface is permanently occluded on the virtual
+    // display, this manifested as `ghostty_surface_read_text` (used by the
+    // app's socket event-subscription polling, which locks
+    // `renderer_state.mutex`) hanging indefinitely. Throttling instead of
+    // skipping keeps updateFrame -- and everything gated behind it --
+    // making forward progress at a bounded rate even while occluded. See
+    // the comment on `OCCLUDED_UPDATE_INTERVAL_MS` for the frequency
+    // rationale.
+    const should_update_frame = update: {
+        if (t.flags.visible) break :update true;
+
+        const last = t.last_occluded_update orelse break :update true;
+        const now = std.time.Instant.now() catch break :update true;
+        break :update now.since(last) >= OCCLUDED_UPDATE_INTERVAL_MS * std.time.ns_per_ms;
+    };
+
+    if (should_update_frame) {
         t.renderer.updateFrame(
             t.state,
             t.flags.cursor_blink_visible,
         ) catch |err|
             log.warn("error rendering err={}", .{err});
+
+        // Only track the throttle timestamp while occluded; once visible
+        // we always update on every wakeup (unchanged from upstream), so
+        // there's nothing to throttle and no reason to pay for a clock
+        // read.
+        if (!t.flags.visible) {
+            t.last_occluded_update = std.time.Instant.now() catch t.last_occluded_update;
+        }
     }
 
     // Draw
