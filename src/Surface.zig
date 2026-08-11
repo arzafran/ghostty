@@ -6090,6 +6090,14 @@ fn writeScreenFile(
     write_screen: input.Binding.Action.WriteScreen,
 ) !void {
     // Create a temporary directory to store our scrollback.
+    //
+    // On success the directory deliberately outlives this call: the path is
+    // handed to the clipboard, an external opener, or the pty, all of which
+    // need the file to still be there. That is why cleanup is `errdefer` and
+    // not `defer`. We still have to release our two directory handles though,
+    // via `close` at the end -- otherwise every call leaks a descriptor on
+    // the temp directory, which adds up quickly when a program drives this
+    // on a timer rather than a keybinding.
     var tmp_dir = try internal_os.TempDir.init();
     errdefer tmp_dir.deinit();
 
@@ -6210,6 +6218,10 @@ fn writeScreenFile(
             path,
         ), .unlocked),
     }
+
+    // The file stays on disk for whoever we just handed the path to; only
+    // our own descriptors are released here.
+    tmp_dir.close();
 }
 
 /// Call this to complete a clipboard request sent to apprt. This should

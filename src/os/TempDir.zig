@@ -67,6 +67,23 @@ pub fn deinit(self: *TempDir) void {
     self.dir.close();
     self.parent.deleteTree(self.name()) catch |err|
         log.err("error deleting temp dir err={}", .{err});
+    // `init` opens a handle on the parent (the system temp directory) as
+    // well as on the directory it creates. Both have to be released or every
+    // TempDir leaks a descriptor on the temp directory for the life of the
+    // process, which is only invisible while TempDir is used rarely.
+    self.parent.close();
+}
+
+/// Release our directory handles but leave the directory and its contents
+/// on disk.
+///
+/// Use this instead of `deinit` when the files written here have to outlive
+/// this struct -- for example when their path is handed to another process,
+/// which cannot be given a path that has already been deleted. The directory
+/// is left for the system's temporary-file reaper to collect.
+pub fn close(self: *TempDir) void {
+    self.dir.close();
+    self.parent.close();
 }
 
 // The amount of random bytes to get to determine our filename.
