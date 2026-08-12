@@ -652,6 +652,17 @@ pub fn init(
         break :command config.command;
     };
 
+    // Revival: if the embedder requested attaching to an already-running
+    // child's pty instead of spawning a new one. See Exec.Config.revive_fd.
+    const revive_fd: ?std.posix.fd_t = if (comptime @hasDecl(apprt.runtime.Surface, "revivePtyFd"))
+        rt_surface.revivePtyFd()
+    else
+        null;
+    const revive_pid: ?std.posix.pid_t = if (comptime @hasDecl(apprt.runtime.Surface, "reviveChildPid"))
+        rt_surface.reviveChildPid()
+    else
+        null;
+
     // Start our IO implementation
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
@@ -709,6 +720,8 @@ pub fn init(
                 .term = config.term,
                 .rt_pre_exec_info = .init(config),
                 .rt_post_fork_info = .init(config),
+                .revive_fd = revive_fd,
+                .revive_pid = revive_pid,
             });
             errdefer io_exec.deinit();
             break :exec .{ .exec = io_exec };
