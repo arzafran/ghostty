@@ -4,20 +4,26 @@ pub const Thread = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const xev = @import("../global.zig").xev;
+const global = @import("../global.zig");
+const xev = global.xev;
 const crash = @import("../crash/main.zig");
 const internal_os = @import("../os/main.zig");
 const rendererpkg = @import("../renderer.zig");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
+const terminalpkg = @import("../terminal/main.zig");
 const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
 const App = @import("../App.zig");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.renderer_thread);
 
-const DRAW_INTERVAL = 8; // 120 FPS
 const CURSOR_BLINK_INTERVAL = 600;
+
+/// Minimum time between frame-state rebuilds while a surface is occluded.
+/// A hard skip stalls renderer state machines that require periodic
+/// `updateFrame` progress, including screen-text reads on headless CI.
+const OCCLUDED_UPDATE_INTERVAL_MS = 250;
 
 /// Whether calls to `drawFrame` must be done from the app thread.
 ///
@@ -51,16 +57,15 @@ wakeup_c: xev.Completion = .{},
 stop: xev.Async,
 stop_c: xev.Completion = .{},
 
-/// The timer used for rendering
+/// The timer used for animations (custom shaders, Kitty graphics).
+/// Normal rendering is driven by wakeup messages instead.
 render_h: xev.Timer,
 render_c: xev.Completion = .{},
+render_c_cancel: xev.Completion = .{},
 
-/// The timer used for draw calls. Draw calls don't update from the
-/// terminal state so they're much cheaper. They're used for animation
-/// and are paused when the terminal is not focused.
-draw_h: xev.Timer,
-draw_c: xev.Completion = .{},
-draw_active: bool = false,
+/// The kind of work the currently scheduled animation wake needs,
+/// stored when the timer is armed.
+animation_wake: rendererpkg.Renderer.AnimationWake.Kind = .draw,
 
 /// This async is used to force a draw immediately. This does not
 /// coalesce like the wakeup does.
@@ -71,6 +76,9 @@ draw_now_c: xev.Completion = .{},
 cursor_h: xev.Timer,
 cursor_c: xev.Completion = .{},
 cursor_c_cancel: xev.Completion = .{},
+
+/// Incremental scrollback compression scheduling.
+compression: Compression = undefined,
 
 /// The surface we're rendering to.
 surface: *apprt.Surface,
@@ -95,6 +103,10 @@ config: DerivedConfig,
 /// throttle the greppable `render.frame.acquire.timeout` log line. Wraps.
 frame_acquire_timeouts: u64 = 0,
 
+/// Timestamp of the last frame-state rebuild while occluded. Reset on the
+/// visible-to-occluded transition so the first hidden update runs immediately.
+last_occluded_update: ?std.Io.Timestamp = null,
+
 flags: packed struct {
     /// This is true when a blinking cursor should be visible and false
     /// when it should not be visible. This is toggled on a timer by the
@@ -114,11 +126,11 @@ flags: packed struct {
 } = .{},
 
 pub const DerivedConfig = struct {
-    custom_shader_animation: configpkg.CustomShaderAnimation,
+    scrollback_compression: bool,
 
     pub fn init(config: *const configpkg.Config) DerivedConfig {
         return .{
-            .custom_shader_animation = config.@"custom-shader-animation",
+            .scrollback_compression = config.@"scrollback-compression",
         };
     }
 };
@@ -150,10 +162,6 @@ pub fn init(
     var render_h = try xev.Timer.init();
     errdefer render_h.deinit();
 
-    // Draw timer, see comments.
-    var draw_h = try xev.Timer.init();
-    errdefer draw_h.deinit();
-
     // Draw now async, see comments.
     var draw_now = try xev.Async.init();
     errdefer draw_now.deinit();
@@ -166,14 +174,13 @@ pub fn init(
     var mailbox = try Mailbox.create(alloc);
     errdefer mailbox.destroy(alloc);
 
-    return .{
+    var result: Thread = .{
         .alloc = alloc,
         .config = .init(config),
         .loop = loop,
         .wakeup = wakeup_h,
         .stop = stop_h,
         .render_h = render_h,
-        .draw_h = draw_h,
         .draw_now = draw_now,
         .cursor_h = cursor_timer,
         .surface = surface,
@@ -182,6 +189,14 @@ pub fn init(
         .mailbox = mailbox,
         .app_mailbox = app_mailbox,
     };
+
+    // Only enable compression if we have it enabled... save some
+    // minor resources.
+    if (comptime terminalpkg.compression_enabled) {
+        result.compression = try .init();
+    }
+
+    return result;
 }
 
 /// Clean up the thread. This is only safe to call once the thread
@@ -190,9 +205,10 @@ pub fn deinit(self: *Thread) void {
     self.stop.deinit();
     self.wakeup.deinit();
     self.render_h.deinit();
-    self.draw_h.deinit();
     self.draw_now.deinit();
     self.cursor_h.deinit();
+    if (comptime terminalpkg.compression_enabled)
+        self.compression.deinit();
     self.loop.deinit();
 
     // Nothing can possibly access the mailbox anymore, destroy it.
@@ -206,13 +222,16 @@ pub fn renderNow(self: *Thread) void {
     self.drainMailbox() catch |err|
         log.err("renderNow: error draining mailbox err={}", .{err});
 
-    self.renderer.updateFrame(
-        self.state,
-        self.flags.cursor_blink_visible,
-    ) catch |err| {
-        log.warn("renderNow: error updating frame err={}", .{err});
-        return;
-    };
+    if (self.shouldUpdateFrame()) {
+        self.renderer.updateFrame(
+            self.state,
+            self.flags.cursor_blink_visible,
+        ) catch |err| {
+            log.warn("renderNow: error updating frame err={}", .{err});
+            return;
+        };
+        self.recordOccludedUpdate();
+    }
 
     self.drawFrame(true);
 }
@@ -292,8 +311,9 @@ fn threadMain_(self: *Thread) !void {
         cursorTimerCallback,
     );
 
-    // Start the draw timer
-    self.syncDrawTimer();
+    // Arm the animation timer in case the renderer already needs
+    // animation wakes (e.g. custom shaders loaded at startup).
+    self.armAnimationTimer();
 
     // Run
     log.debug("starting renderer thread", .{});
@@ -331,47 +351,6 @@ fn setQosClass(self: *const Thread) void {
     }
 }
 
-fn syncDrawTimer(self: *Thread) void {
-    skip: {
-        // If our renderer supports animations and has them, then we
-        // can apply draw timer based on custom shader animation configuration.
-        if (@hasDecl(rendererpkg.Renderer, "hasAnimations") and
-            self.renderer.hasAnimations())
-        {
-            // If our config says to always animate, we do so.
-            switch (self.config.custom_shader_animation) {
-                // Always animate
-                .always => break :skip,
-                // Only when focused
-                .true => if (self.flags.focused) break :skip,
-                // Never animate
-                .false => {},
-            }
-        }
-
-        // We're skipping the draw timer. Stop it on the next iteration.
-        self.draw_active = false;
-        return;
-    }
-
-    // Set our active state so it knows we're running. We set this before
-    // even checking the active state in case we have a pending shutdown.
-    self.draw_active = true;
-
-    // If our draw timer is already active, then we don't have to do anything.
-    if (self.draw_c.state() == .active) return;
-
-    // Start the timer which loops
-    self.draw_h.run(
-        &self.loop,
-        &self.draw_c,
-        DRAW_INTERVAL,
-        Thread,
-        self,
-        drawCallback,
-    );
-}
-
 /// Drain the mailbox.
 fn drainMailbox(self: *Thread) !void {
     // There's probably a more elegant way to do this...
@@ -384,7 +363,7 @@ fn drainMailbox(self: *Thread) !void {
         void;
     defer if (builtin.os.tag.isDarwin()) pool.deinit();
 
-    while (self.mailbox.pop()) |message| {
+    while (self.mailbox.pop(global.io())) |message| {
         log.debug("mailbox message={}", .{message});
         switch (message) {
             .crash => @panic("crash request, crashing intentionally"),
@@ -399,10 +378,16 @@ fn drainMailbox(self: *Thread) !void {
                 // Visibility affects our QoS class
                 self.setQosClass();
 
-                // If we became visible then we immediately trigger a draw.
-                // We don't need to update frame data because that should
-                // still be happening.
-                if (v) self.drawFrame(false);
+                if (v) {
+                    // Force a complete rebuild when returning from the
+                    // throttled hidden state, then resume Kitty animation
+                    // scheduling through the normal callback.
+                    self.renderer.markDirty();
+                    _ = renderCallback(self, undefined, undefined, {});
+                } else {
+                    // Let the first occluded update run immediately.
+                    self.last_occluded_update = null;
+                }
 
                 // Notify the renderer so it can update any state.
                 self.renderer.setVisible(v);
@@ -428,8 +413,9 @@ fn drainMailbox(self: *Thread) !void {
                 // Set it on the renderer
                 try self.renderer.setFocus(v);
 
-                // We always resync our draw timer (may disable it)
-                self.syncDrawTimer();
+                // Focus gates custom shader animation, so re-arm
+                // the animation timer for the new state.
+                self.armAnimationTimer();
 
                 if (!v) {
                     // If we're not focused, then we stop the cursor blink
@@ -490,9 +476,9 @@ fn drainMailbox(self: *Thread) !void {
                 try self.changeConfig(config.thread);
                 try self.renderer.changeConfig(config.impl);
 
-                // Stop and start the draw timer to capture the new
-                // hasAnimations value.
-                self.syncDrawTimer();
+                // The config affects what animation wakes the
+                // renderer needs (custom shaders, animation mode).
+                self.armAnimationTimer();
             },
 
             .search_viewport_matches => |v| {
@@ -517,7 +503,7 @@ fn drainMailbox(self: *Thread) !void {
 
             .macos_display_id => |v| {
                 if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
-                    try self.renderer.setMacOSDisplayID(v);
+                    try self.renderer.setMacOSDisplayID(v, &self.draw_now);
                 }
             },
 
@@ -538,6 +524,16 @@ fn drainMailbox(self: *Thread) !void {
 }
 
 fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
+    // A newly enabled scheduler must reconsider existing history even when no
+    // terminal activity occurred while compression was disabled.
+    if (comptime terminalpkg.compression_enabled) {
+        if (!self.config.scrollback_compression and
+            config.scrollback_compression)
+        {
+            self.compression.activity = null;
+        }
+    }
+
     self.config = config.*;
 }
 
@@ -613,6 +609,10 @@ fn wakeupCallback(
     // Render immediately
     _ = renderCallback(t, undefined, undefined, {});
 
+    // PageList mutations maintain their own compression dirty state. Checking
+    // it here covers output, resize, and viewport scrolling uniformly.
+    t.compression.wake(t);
+
     // The below is not used anymore but if we ever want to introduce
     // a configuration to introduce a delay to coalesce renders, we can
     // use this.
@@ -651,54 +651,123 @@ fn drawNowCallback(
     return .rearm;
 }
 
-fn drawCallback(
-    self_: ?*Thread,
-    _: *xev.Loop,
-    _: *xev.Completion,
-    r: xev.Timer.RunError!void,
-) xev.CallbackAction {
-    _ = r catch unreachable;
-    const t: *Thread = self_ orelse {
-        // This shouldn't happen so we log it.
-        log.warn("render callback fired without data set", .{});
-        return .disarm;
-    };
-
-    // Draw
-    t.drawFrame(false);
-
-    // Only continue if we're still active
-    if (t.draw_active) {
-        t.draw_h.run(&t.loop, &t.draw_c, DRAW_INTERVAL, Thread, t, drawCallback);
-    }
-
-    return .disarm;
-}
-
 fn renderCallback(
     self_: ?*Thread,
     _: *xev.Loop,
     _: *xev.Completion,
     r: xev.Timer.RunError!void,
 ) xev.CallbackAction {
-    _ = r catch unreachable;
+    _ = r catch |err| switch (err) {
+        // Sent when a scheduled animation wakeup is superseded by a
+        // newer one (Timer.reset cancels the pending run). Nothing to
+        // do; the replacement timer carries on.
+        error.Canceled => return .disarm,
+        else => unreachable,
+    };
     const t: *Thread = self_ orelse {
         // This shouldn't happen so we log it.
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
 
-    // Update our frame data
-    t.renderer.updateFrame(
-        t.state,
-        t.flags.cursor_blink_visible,
-    ) catch |err|
-        log.warn("error rendering err={}", .{err});
+    // Rebuild every wake while visible. While occluded, rebuild at 4 Hz
+    // instead of skipping entirely so screen-text and renderer handshakes
+    // continue to make forward progress on headless displays.
+    if (t.shouldUpdateFrame()) {
+        t.renderer.updateFrame(
+            t.state,
+            t.flags.cursor_blink_visible,
+        ) catch |err|
+            log.warn("error rendering err={}", .{err});
+        t.recordOccludedUpdate();
+    }
 
     // Draw
     t.drawFrame(false);
 
+    // Schedule the next animation wake, if the renderer needs one.
+    t.armAnimationTimer();
+
     return .disarm;
+}
+
+fn shouldUpdateFrame(self: *const Thread) bool {
+    if (self.flags.visible) return true;
+    const last = self.last_occluded_update orelse return true;
+    return last.untilNow(global.io(), .awake).toMilliseconds() >=
+        OCCLUDED_UPDATE_INTERVAL_MS;
+}
+
+fn recordOccludedUpdate(self: *Thread) void {
+    if (!self.flags.visible) {
+        self.last_occluded_update = .now(global.io(), .awake);
+    }
+}
+
+/// Schedule the animation timer for the renderer's next animation
+/// wake, if it needs one.
+///
+/// This is called after every frame update or animation draw and
+/// whenever the wake inputs change (focus, config, visibility
+/// regain). Resetting a pending timer is always safe: every call
+/// recomputes the wake, so the deadline only ever moves toward the
+/// actual next wake.
+fn armAnimationTimer(self: *Thread) void {
+    const wake = self.renderer.animationWake() orelse return;
+    self.animation_wake = wake.kind;
+    self.render_h.reset(
+        &self.loop,
+        &self.render_c,
+        &self.render_c_cancel,
+        wake.delay_ms,
+        Thread,
+        self,
+        animationTimerCallback,
+    );
+}
+
+fn animationTimerCallback(
+    self_: ?*Thread,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        // Sent when a scheduled animation wake is superseded by a
+        // newer one (Timer.reset cancels the pending run). Nothing to
+        // do; the replacement timer carries on.
+        error.Canceled => return .disarm,
+        else => unreachable,
+    };
+    const t: *Thread = self_ orelse {
+        // This shouldn't happen so we log it.
+        log.warn("animation callback fired without data set", .{});
+        return .disarm;
+    };
+
+    // Animations pause entirely while we're invisible; the .visible
+    // mailbox message re-arms us when we can be seen again.
+    if (!t.flags.visible) return .disarm;
+
+    switch (t.animation_wake) {
+        // Frame data must be updated (a Kitty animation frame is
+        // due). renderCallback updates, draws, and re-arms us.
+        .update => return renderCallback(
+            t,
+            undefined,
+            undefined,
+            {},
+        ),
+
+        // A redraw alone suffices (custom shader time uniform).
+        // Draw calls don't update from the terminal state so they
+        // are much cheaper than a frame update.
+        .draw => {
+            t.drawFrame(false);
+            t.armAnimationTimer();
+            return .disarm;
+        },
+    }
 }
 
 fn cursorTimerCallback(
@@ -795,3 +864,113 @@ fn cursorBlinkInterval() u64 {
 
     return CURSOR_BLINK_INTERVAL;
 }
+
+/// Schedules incremental terminal compression after renderer activity stops.
+///
+/// This owns all renderer-specific compression state. The terminal decides
+/// when compression-relevant activity changes and performs the actual work;
+/// the renderer only provides idle scheduling and avoids waiting for the
+/// terminal lock.
+const Compression = struct {
+    const idle_interval = 250;
+    const step_interval = 1;
+
+    timer: xev.Timer,
+    completion: xev.Completion = .{},
+    reset_completion: xev.Completion = .{},
+    activity: ?u64 = null,
+
+    fn init() !Compression {
+        return .{ .timer = try xev.Timer.init() };
+    }
+
+    fn deinit(self: *Compression) void {
+        self.timer.deinit();
+    }
+
+    /// Start or postpone compression after a renderer wake.
+    fn wake(self: *Compression, thread: *Thread) void {
+        // If we have no compression then don't do anything.
+        if (comptime !terminalpkg.compression_enabled) return;
+        if (!thread.config.scrollback_compression) return;
+
+        // PageList activity, rather than a generic renderer wake, restarts the
+        // idle interval. In particular, the inspector wakes the renderer every
+        // frame without changing terminal contents and must not starve this
+        // timer indefinitely.
+        if (thread.state.mutex.tryLock()) {
+            defer thread.state.mutex.unlock(global.io());
+            const activity = thread.state.terminal.compressionActivity();
+            if (self.activity == activity) return;
+            self.activity = activity;
+        } else if (self.completion.state() == .active) {
+            // Contention doesn't prove that compression-relevant activity
+            // changed. Keep an existing deadline so frequent inspector frames
+            // cannot postpone compression forever. The timer rechecks both the
+            // activity token and lock availability before doing any work.
+            return;
+        }
+
+        // Contention may mean parsing is active. Scheduling is a harmless
+        // false positive when no compression work is actually pending, but is
+        // necessary when no timer is already active.
+        self.schedule(thread, idle_interval);
+    }
+
+    /// Start the one-shot timer, or move its deadline if it is already active.
+    fn schedule(self: *Compression, thread: *Thread, delay_ms: u64) void {
+        self.timer.reset(
+            &thread.loop,
+            &self.completion,
+            &self.reset_completion,
+            delay_ms,
+            Thread,
+            thread,
+            timerCallback,
+        );
+    }
+
+    fn timerCallback(
+        thread_: ?*Thread,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        result: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        _ = result catch |err| switch (err) {
+            error.Canceled => return .disarm,
+            else => {
+                log.warn("error in compression timer err={}", .{err});
+                return .disarm;
+            },
+        };
+
+        const thread = thread_ orelse return .disarm;
+        const self = &thread.compression;
+
+        if (self.step(thread)) |delay| self.schedule(thread, delay);
+        return .disarm;
+    }
+
+    /// Try one bounded step without waiting for the terminal lock. The return
+    /// value is the delay before another attempt, or null when work is done.
+    fn step(self: *Compression, thread: *Thread) ?u64 {
+        if (!thread.config.scrollback_compression) return null;
+
+        const state = thread.state;
+        if (!state.mutex.tryLock()) return idle_interval;
+        defer state.mutex.unlock(global.io());
+
+        const activity = state.terminal.compressionActivity();
+        if (self.activity != activity) {
+            self.activity = activity;
+            return idle_interval;
+        }
+
+        return switch (state.terminal.compress(.incremental)) {
+            .pending => step_interval,
+            .unsupported,
+            .complete,
+            => null,
+        };
+    }
+};

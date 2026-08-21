@@ -39,16 +39,68 @@ void on_title_changed(GhosttyTerminal terminal, void* userdata) {
 }
 //! [effects-title-changed]
 
+//! [effects-clipboard-write]
+GhosttyClipboardWriteResult on_clipboard_write(
+    GhosttyTerminal terminal,
+    void* userdata,
+    const GhosttyClipboardWrite* write) {
+  (void)terminal;
+  (void)userdata;
+
+  printf("  clipboard write (location=%d, contents=%zu)\n",
+         (int)write->location, write->contents_len);
+  if (write->contents_len == 0) {
+    printf("    clear\n");
+  }
+
+  for (size_t i = 0; i < write->contents_len; i++) {
+    const GhosttyClipboardContent* content = &write->contents[i];
+    printf("    ");
+    if (content->mime.len > 0) {
+      fwrite(content->mime.ptr, 1, content->mime.len, stdout);
+    }
+    printf(" (%zu bytes): ", content->data.len);
+    if (content->data.len > 0) {
+      fwrite(content->data.ptr, 1, content->data.len, stdout);
+    }
+    printf("\n");
+  }
+
+  return GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS;
+}
+//! [effects-clipboard-write]
+
+//! [effects-unknown-sequence]
+void on_unknown_sequence(
+    GhosttyTerminal terminal,
+    void* userdata,
+    const GhosttyTerminalUnknownSequence* sequence) {
+  (void)terminal;
+  (void)userdata;
+
+  switch (sequence->tag) {
+  case GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_APC: {
+    const GhosttyTerminalUnknownStringSequence* apc = &sequence->value.apc;
+    printf("  unknown APC (truncated=%s, content=%zu bytes): ",
+           apc->truncated ? "yes" : "no",
+           apc->content.len);
+    if (apc->content.len > 0) {
+      fwrite(apc->content.ptr, 1, apc->content.len, stdout);
+    }
+    printf("\n");
+    break;
+  }
+  default:
+    break;
+  }
+}
+//! [effects-unknown-sequence]
+
 //! [effects-register]
 int main() {
   // Create a terminal
   GhosttyTerminal terminal = NULL;
-  GhosttyTerminalOptions opts = {
-    .cols = 80,
-    .rows = 24,
-    .max_scrollback = 0,
-  };
-  if (ghostty_terminal_new(NULL, &terminal, opts) != GHOSTTY_SUCCESS) {
+  if (ghostty_terminal_new(NULL, &terminal, 80, 24) != GHOSTTY_SUCCESS) {
     fprintf(stderr, "Failed to create terminal\n");
     return 1;
   }
@@ -64,6 +116,16 @@ int main() {
       (const void *)on_bell);
   ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED,
       (const void *)on_title_changed);
+  ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE,
+      (const void *)on_clipboard_write);
+  ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE,
+      (const void *)on_unknown_sequence);
+
+  // Unknown sequence capture is independently bounded and disabled by
+  // default. This limit will apply to every supported unknown sequence type.
+  size_t unknown_max_bytes = 256;
+  ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES,
+      &unknown_max_bytes);
 
   // Feed VT data that triggers effects:
 
@@ -85,7 +147,20 @@ int main() {
   ghostty_terminal_vt_write(terminal, (const uint8_t*)decrqm,
                             strlen(decrqm));
 
-  // 4. Another bell to show the counter increments
+  // 4. Clipboard write (OSC 52 ; c ; <base64 data> ST)
+  printf("Sending clipboard write:\n");
+  const char* clipboard_seq =
+      "\x1B]52;c;SGVsbG8gY2xpcGJvYXJk\x1B\\";
+  ghostty_terminal_vt_write(terminal, (const uint8_t*)clipboard_seq,
+                            strlen(clipboard_seq));
+
+  // 5. Unsupported APC sequence
+  printf("Sending unknown APC:\n");
+  const char* unknown_apc = "\x1B_private-command;payload\x1B\\";
+  ghostty_terminal_vt_write(terminal, (const uint8_t*)unknown_apc,
+                            strlen(unknown_apc));
+
+  // 6. Another bell to show the counter increments
   printf("Sending another BEL:\n");
   ghostty_terminal_vt_write(terminal, &bel, 1);
 

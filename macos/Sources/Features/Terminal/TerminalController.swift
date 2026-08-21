@@ -344,13 +344,14 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         confirmUndo: Bool = true,
         inheritBackgroundOpacity: Bool? = nil
     ) -> TerminalController {
+        // Calculate the target frame based on the tree's view bounds
+        // before moving into the new window
+        let treeSize: CGSize? = tree.root?.viewBounds()
+
         let c = TerminalController.init(ghostty, withSurfaceTree: tree)
         if let inheritBackgroundOpacity {
             c.isBackgroundOpaque = inheritBackgroundOpacity
         }
-
-        // Calculate the target frame based on the tree's view bounds
-        let treeSize: CGSize? = tree.root?.viewBounds()
 
         c.scheduleInitialPresentation {
             c.showWindow(self)
@@ -480,8 +481,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 Self.applyCascade(to: window, hasFixedPos: hasFixedPos)
             }
 
-            controller.showWindow(self)
-            window.makeKeyAndOrderFront(self)
+            // showWindow makes regular windows key and ordered front. AppKit can
+            // throw while selecting a tab if its fullscreen stack is inconsistent,
+            // so this must cross the Objective-C exception bridge.
+            controller.showWindowSafely(self)
 
             // We also activate our app so that it becomes front. This may be
             // necessary for the dock menu.
@@ -503,14 +506,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 withTarget: controller,
                 expiresAfter: controller.undoExpiration
             ) { target in
-                // Close the tab when undoing. We do this in a DispatchQueue because
-                // for some people on macOS Tahoe this caused a crash and the queue
-                // fixes it.
-                // https://github.com/ghostty-org/ghostty/pull/9512
-                DispatchQueue.main.async {
-                    undoManager.disableUndoRegistration {
-                        target.closeTab(nil)
-                    }
+                // Close the tab when undoing
+                undoManager.disableUndoRegistration {
+                    target.closeTab(nil)
                 }
 
                 // Register redo action
@@ -672,12 +670,20 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         // More than 1 window means we have tabs and we're closing a tab
         if window?.tabGroup?.windows.count ?? 0 > 1 {
-            closeTab(nil)
+            if withConfirmation {
+                closeTab(nil)
+            } else {
+                closeTabImmediately()
+            }
             return
         }
 
         // 1 window, closing the window
-        closeWindow(nil)
+        if withConfirmation {
+            closeWindow(nil)
+        } else {
+            closeWindowImmediately()
+        }
     }
 
     func closeTabImmediately(registerRedo: Bool = true) {
@@ -1113,7 +1119,16 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // We don't run this logic in fullscreen because in fullscreen this will end up
         // removing the window and putting it into its own dedicated fullscreen, which is not
         // the expected or desired behavior of anyone I've found.
-        if !window.styleMask.contains(.fullScreen) {
+        //
+        // We also only run this when the system tabbing preference is "always",
+        // which is the only scenario AppKit will have auto-tabbed a fresh window
+        // at this point: the tab bar "+" button goes through newWindowForTab
+        // which we route through our own tab logic. This check matters because
+        // accessing `window.tabGroup` materializes the window's tab group
+        // machinery, which takes ~15-20ms and is otherwise not needed during
+        // window creation.
+        if NSWindow.userTabbingPreference == .always,
+           !window.styleMask.contains(.fullScreen) {
             // If we have more than 1 window in our tab group we know we're a new window.
             // Since Ghostty manages tabbing manually this will never be more than one
             // at this point in the AppKit lifecycle (we add to the group after this).
@@ -1154,6 +1169,8 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         super.showWindow(sender)
+
+        syncAppearance()
     }
 
     // Shows the "+" button in the tab bar, responds to that click.
@@ -1222,12 +1239,6 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         super.windowDidBecomeKey(notification)
         self.relabelTabs()
         self.fixTabBar()
-        terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: true)
-    }
-
-    override func windowDidResignKey(_ notification: Notification) {
-        super.windowDidResignKey(notification)
-        terminalViewContainer?.updateGlassTintOverlay(isKeyWindow: false)
     }
 
     override func windowDidMove(_ notification: Notification) {
@@ -1410,9 +1421,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         // We also want to get notified of certain changes to update our appearance.
         focusedSurface.$derivedConfig
+            .dropFirst()
             .sink { [weak self, weak focusedSurface] _ in self?.syncAppearanceOnPropertyChange(focusedSurface) }
             .store(in: &surfaceAppearanceCancellables)
         focusedSurface.$backgroundColor
+            .dropFirst()
             .sink { [weak self, weak focusedSurface] _ in self?.syncAppearanceOnPropertyChange(focusedSurface) }
             .store(in: &surfaceAppearanceCancellables)
     }

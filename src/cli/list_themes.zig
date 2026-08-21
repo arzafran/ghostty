@@ -6,7 +6,7 @@ const Config = @import("../config/Config.zig");
 const configpkg = @import("../config.zig");
 const themepkg = @import("../config/theme.zig");
 const tui = @import("tui.zig");
-const global_state = &@import("../global.zig").state;
+const global = @import("../global.zig");
 
 const vaxis = @import("vaxis");
 const zf = @import("zf");
@@ -183,7 +183,7 @@ pub fn run(gpa_alloc: std.mem.Allocator) !u8 {
     defer opts.deinit();
 
     {
-        var iter = try args.argsIterator(gpa_alloc);
+        var iter = try args.argsIterator(gpa_alloc, global.args());
         defer iter.deinit();
         try args.parse(Options, gpa_alloc, &opts, &iter);
     }
@@ -192,15 +192,15 @@ pub fn run(gpa_alloc: std.mem.Allocator) !u8 {
     const alloc = arena.allocator();
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_file: std.fs.File = .stdout();
-    var stdout_writer = stdout_file.writer(&stdout_buf);
+    var stdout_file: std.Io.File = .stdout();
+    var stdout_writer = stdout_file.writer(global.io(), &stdout_buf);
     const stdout = &stdout_writer.interface;
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(global.io(), &stderr_buf);
     const stderr = &stderr_writer.interface;
 
-    const resources_dir = global_state.resources_dir.app();
+    const resources_dir = global.resourcesDir().app();
     if (resources_dir == null)
         try stderr.print("Could not find the Ghostty resources directory. Please ensure " ++
             "that Ghostty is installed correctly.\n", .{});
@@ -212,18 +212,22 @@ pub fn run(gpa_alloc: std.mem.Allocator) !u8 {
     var it: themepkg.LocationIterator = .{ .arena_alloc = arena.allocator() };
 
     while (try it.next()) |loc| {
-        var dir = std.fs.cwd().openDir(loc.dir, .{ .iterate = true }) catch |err| switch (err) {
+        var dir = std.Io.Dir.cwd().openDir(
+            global.io(),
+            loc.dir,
+            .{ .iterate = true },
+        ) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => {
                 std.debug.print("error trying to open {s}: {}\n", .{ loc.dir, err });
                 continue;
             },
         };
-        defer dir.close();
+        defer dir.close(global.io());
 
         var walker = dir.iterate();
 
-        while (try walker.next()) |entry| {
+        while (try walker.next(global.io())) |entry| {
             switch (entry.kind) {
                 .file, .sym_link => {
                     if (std.mem.eql(u8, entry.name, ".DS_Store"))
@@ -249,7 +253,7 @@ pub fn run(gpa_alloc: std.mem.Allocator) !u8 {
 
     std.mem.sortUnstable(ThemeListElement, themes.items, {}, ThemeListElement.lessThan);
 
-    if (tui.can_pretty_print and !opts.plain and stdout_file.isTty()) {
+    if (tui.can_pretty_print and !opts.plain and try stdout_file.isTty(global.io())) {
         try preview(gpa_alloc, themes.items, opts.color);
         return 0;
     }
@@ -285,23 +289,27 @@ fn writeAutoThemeFile(alloc: std.mem.Allocator, theme_name: []const u8) !void {
     defer alloc.free(auto_path);
 
     if (std.fs.path.dirname(auto_path)) |dir| {
-        try std.fs.cwd().makePath(dir);
+        try std.Io.Dir.cwd().createDirPath(global.io(), dir);
     }
 
-    var f = try std.fs.createFileAbsolute(auto_path, .{ .truncate = true });
-    defer f.close();
+    var f = try std.Io.Dir.createFileAbsolute(
+        global.io(),
+        auto_path,
+        .{ .truncate = true },
+    );
+    defer f.close(global.io());
 
     var buf: [128]u8 = undefined;
-    var w = f.writer(&buf);
+    var w = f.writer(global.io(), &buf);
     try w.interface.print("theme = {s}\n", .{theme_name});
     try w.interface.flush();
 }
 
 fn trimmedEnvValue(alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
-    const raw = std.process.getEnvVarOwned(alloc, key) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => return null,
-        else => return err,
-    };
+    var env = try global.environMap();
+    defer env.deinit();
+    const value = env.get(key) orelse return null;
+    const raw = try alloc.dupe(u8, value);
 
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) {
@@ -318,39 +326,43 @@ fn trimmedEnvValue(alloc: std.mem.Allocator, key: []const u8) !?[]u8 {
 }
 
 fn readOptionalFile(alloc: std.mem.Allocator, path: []const u8) !?[]u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    return std.Io.Dir.cwd().readFileAlloc(
+        global.io(),
+        path,
+        alloc,
+        .limited(1024 * 1024),
+    ) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer file.close();
-
-    return try file.readToEndAlloc(alloc, 1024 * 1024);
 }
 
 fn writeAbsoluteFile(path: []const u8, contents: []const u8) !void {
     if (std.fs.path.dirname(path)) |dir| {
-        try std.fs.cwd().makePath(dir);
-        var dir_handle = try std.fs.openDirAbsolute(dir, .{});
-        defer dir_handle.close();
+        try std.Io.Dir.cwd().createDirPath(global.io(), dir);
+        var dir_handle = try std.Io.Dir.openDirAbsolute(global.io(), dir, .{});
+        defer dir_handle.close(global.io());
 
         var buf: [1024]u8 = undefined;
-        var atomic_file = try dir_handle.atomicFile(std.fs.path.basename(path), .{
-            .mode = 0o600,
-            .write_buffer = &buf,
+        var atomic_file = try dir_handle.createFileAtomic(global.io(), std.fs.path.basename(path), .{
+            .permissions = .fromMode(0o600),
+            .replace = true,
         });
-        defer atomic_file.deinit();
+        defer atomic_file.deinit(global.io());
 
-        try atomic_file.file_writer.interface.writeAll(contents);
-        try atomic_file.finish();
+        var writer = atomic_file.file.writer(global.io(), &buf);
+        try writer.interface.writeAll(contents);
+        try writer.interface.flush();
+        try atomic_file.replace(global.io());
         return;
     }
 
-    var file = try std.fs.createFileAbsolute(path, .{
+    var file = try std.Io.Dir.createFileAbsolute(global.io(), path, .{
         .truncate = true,
-        .mode = 0o600,
+        .permissions = .fromMode(0o600),
     });
-    defer file.close();
-    try file.writeAll(contents);
+    defer file.close(global.io());
+    try file.writeStreamingAll(global.io(), contents);
 }
 
 fn removeManagedThemeOverride(
@@ -456,7 +468,7 @@ fn restoreCmuxThemeOverride(cmux: *const CmuxThemePicker) !void {
         return;
     }
 
-    std.fs.deleteFileAbsolute(cmux.config_path) catch |err| switch (err) {
+    std.Io.Dir.deleteFileAbsolute(global.io(), cmux.config_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
@@ -529,6 +541,7 @@ const Preview = struct {
         apply,
     },
     tty: vaxis.Tty,
+    env_map: std.process.Environ.Map,
     vx: vaxis.Vaxis,
     mouse: ?vaxis.Mouse,
     themes: []ThemeListElement,
@@ -559,14 +572,16 @@ const Preview = struct {
         buf: []u8,
     ) !*Preview {
         const self = try allocator.create(Preview);
+        errdefer allocator.destroy(self);
         const cmux = try CmuxThemePicker.load(allocator);
 
         self.* = .{
             .allocator = allocator,
             .should_quit = false,
             .outcome = .cancel,
-            .tty = try .init(buf),
-            .vx = try vaxis.init(allocator, .{}),
+            .tty = try .init(global.io(), buf),
+            .env_map = try global.environMap(),
+            .vx = undefined,
             .mouse = null,
             .themes = themes,
             .filtered = try .initCapacity(allocator, themes.len),
@@ -584,6 +599,7 @@ const Preview = struct {
             .cmux_applied_light = if (cmux) |value| value.initial_light else null,
             .cmux_applied_dark = if (cmux) |value| value.initial_dark else null,
         };
+        self.vx = try vaxis.init(global.io(), allocator, &self.env_map, .{});
 
         try self.updateFiltered();
 
@@ -596,6 +612,7 @@ const Preview = struct {
         self.filtered.deinit(allocator);
         self.text_input.deinit();
         self.vx.deinit(allocator, self.tty.writer());
+        self.env_map.deinit();
         self.tty.deinit();
         allocator.destroy(self);
     }
@@ -606,22 +623,18 @@ const Preview = struct {
             self.restoreCmuxOriginal() catch {};
         };
 
-        var loop: vaxis.Loop(Event) = .{
-            .tty = &self.tty,
-            .vaxis = &self.vx,
-        };
-        try loop.init();
+        var loop: vaxis.Loop(Event) = .init(global.io(), &self.tty, &self.vx);
         try loop.start();
+        defer loop.stop();
 
         const writer = self.tty.writer();
-
         try self.vx.enterAltScreen(writer);
         try self.vx.setTitle(
             writer,
             if (self.cmux != null) "cmux Theme Preview" else "👻 Ghostty Theme Preview 👻",
         );
         if (self.cmux == null) {
-            try self.vx.queryTerminal(writer, 1 * std.time.ns_per_s);
+            try self.vx.queryTerminal(writer, .fromSeconds(1));
         }
         try self.vx.setMouseMode(writer, true);
         if (self.cmux == null and self.vx.caps.color_scheme_updates)
@@ -632,8 +645,8 @@ const Preview = struct {
             defer arena.deinit();
             const alloc = arena.allocator();
 
-            loop.pollEvent();
-            while (loop.tryEvent()) |event| {
+            try loop.pollEvent();
+            while (try loop.tryEvent()) |event| {
                 try self.update(event, alloc);
             }
             try self.draw(alloc);
@@ -687,7 +700,12 @@ const Preview = struct {
                 if (!shouldIncludeTheme(self.theme_filter, theme_config)) continue;
 
                 theme.rank = zf.rank(theme.theme, tokens.items, .{
-                    .to_lower = true,
+                    // NOTE: Changed from ".to_lower = true" (the option was
+                    // renamed). I think this is the correct analog for case
+                    // insensitive ranking (which is what I'm guessing
+                    // ".to_lower = true" implies, but this comment serves as a
+                    // hint if there's a regression.
+                    .case_sensitive = false,
                     .plain = true,
                 });
                 if (theme.rank != null) try self.filtered.append(self.allocator, i);
@@ -833,11 +851,11 @@ const Preview = struct {
                             try self.updateFiltered();
                             try self.applyCmuxSelectionForCurrentTheme();
                         }
-                        if (key.matchesAny(&.{ vaxis.Key.home, vaxis.Key.kp_home }, .{})) {
+                        if (key.matchesAny(&.{ vaxis.Key.home, vaxis.Key.kp_home, 'g' }, .{})) {
                             self.current = 0;
                             try self.applyCmuxSelectionForCurrentTheme();
                         }
-                        if (key.matchesAny(&.{ vaxis.Key.end, vaxis.Key.kp_end }, .{})) {
+                        if (key.matchesAny(&.{ vaxis.Key.end, vaxis.Key.kp_end, 'G' }, .{})) {
                             self.current = self.filtered.items.len - 1;
                             try self.applyCmuxSelectionForCurrentTheme();
                         }
@@ -1063,14 +1081,22 @@ const Preview = struct {
                     try self.applyCmuxSelectionForCurrentTheme();
                 }
                 if (theme_list.hasMouse(mouse)) |_| {
+                    // NOTE: mouse co-ordinates can be negative (see
+                    // https://github.com/rockorager/libvaxis/pull/276).
+                    // Working around it in this case, but putting this here in
+                    // case there are issues.
                     if (mouse.button == .left and mouse.type == .release) {
-                        const selection = self.window + mouse.row;
+                        const selection: usize = selection: {
+                            var window: i32 = @min(self.window, std.math.maxInt(i32));
+                            window += mouse.row;
+                            break :selection @max(0, window);
+                        };
                         if (selection < self.filtered.items.len) {
                             self.current = selection;
                             try self.applyCmuxSelectionForCurrentTheme();
                         }
                     }
-                    highlight = mouse.row;
+                    highlight = @max(0, mouse.row);
                 }
             }
         }
@@ -1232,8 +1258,8 @@ const Preview = struct {
                     .{ .keys = "d", .help = "Show palette numbers in decimal." },
                     .{ .keys = "c", .help = "Copy theme name to the clipboard." },
                     .{ .keys = "C", .help = "Copy theme path to the clipboard." },
-                    .{ .keys = "Home", .help = "Go to the start of the list." },
-                    .{ .keys = "End", .help = "Go to the end of the list." },
+                    .{ .keys = "Home, g", .help = "Go to the start of the list." },
+                    .{ .keys = "End, G", .help = "Go to the end of the list." },
                     .{ .keys = "/", .help = "Start search." },
                     .{ .keys = "^X, ^/", .help = "Clear search." },
                     .{
