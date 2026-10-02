@@ -375,6 +375,7 @@ pub const StreamHandler = struct {
             // Unimplemented
             .title_push,
             .title_pop,
+            .program_status,
             => {},
         }
     }
