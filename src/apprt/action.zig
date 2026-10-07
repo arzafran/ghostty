@@ -357,6 +357,10 @@ pub const Action = union(Key) {
     /// Move a tab to a new window.
     move_tab_to_new_window,
 
+    /// A program status report (OSC 7501) or a lifecycle event for the
+    /// surface's program status records. The embedder keeps the records.
+    program_status: ProgramStatus,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -428,6 +432,7 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         move_tab_to_new_window,
+        program_status,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -987,6 +992,67 @@ pub const CloseTabMode = enum(c_int) {
 
     test "ghostty.h CloseTabMode" {
         try lib.checkGhosttyHEnum(CloseTabMode, "GHOSTTY_ACTION_CLOSE_TAB_MODE_");
+    }
+};
+
+pub const ProgramStatus = struct {
+    event: Event,
+    state: State = .idle,
+
+    /// The report body after `7501;`, already validated by the parser.
+    /// Only valid for the duration of the action callback. Empty for
+    /// events other than `report`.
+    data: []const u8 = "",
+
+    pub const Event = enum(c_int) {
+        /// A program sent a report.
+        report,
+        /// A full reset (RIS) removed every record.
+        reset_all,
+        /// The shell printed a new prompt (OSC 133;A), so records in a
+        /// transient state (working, blocked) end.
+        prompt,
+
+        test "ghostty.h ProgramStatus.Event" {
+            try lib.checkGhosttyHEnum(Event, "GHOSTTY_PROGRAM_STATUS_EVENT_");
+        }
+    };
+
+    /// Mirrors terminal.osc.Command.ProgramStatus.State with a C tag.
+    pub const State = enum(c_int) {
+        idle,
+        working,
+        done,
+        blocked,
+        @"error",
+        clear,
+
+        pub fn init(state: terminal.osc.Command.ProgramStatus.State) State {
+            return switch (state) {
+                inline else => |tag| @field(State, @tagName(tag)),
+            };
+        }
+
+        test "ghostty.h ProgramStatus.State" {
+            try lib.checkGhosttyHEnum(State, "GHOSTTY_PROGRAM_STATUS_STATE_");
+        }
+    };
+
+    // Sync with: ghostty_action_program_status_s
+    pub const C = extern struct {
+        event: Event,
+        state: State,
+        data: [*]const u8,
+        len: usize,
+    };
+
+    pub fn cval(self: ProgramStatus) C {
+        return .{
+            .event = self.event,
+            .state = self.state,
+            .data = self.data.ptr,
+            .len = self.data.len,
+        };
     }
 };
 

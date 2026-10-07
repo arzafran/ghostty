@@ -69,6 +69,9 @@ pub const StreamHandler = struct {
     /// The tmux control mode viewer state.
     tmux_viewer: if (tmux_enabled) ?*terminal.tmux.Viewer else void = if (tmux_enabled) null else {},
 
+    /// True once the program sent an OSC 7501 report, until a full reset.
+    program_status_seen: bool = false,
+
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
     /// to wake up the termio thread.
@@ -341,6 +344,7 @@ pub const StreamHandler = struct {
             .report_pwd => try self.reportPwd(value.url),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
             .progress_report => self.progressReport(value),
+            .program_status => try self.programStatus(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
             .semantic_prompt => try self.semanticPrompt(value),
@@ -375,7 +379,6 @@ pub const StreamHandler = struct {
             // Unimplemented
             .title_push,
             .title_pop,
-            .program_status,
             => {},
         }
     }
@@ -952,6 +955,12 @@ pub const StreamHandler = struct {
 
         // Clear the progress bar
         self.progressReport(.{ .state = .remove });
+
+        // A full reset removes every program status record.
+        if (self.program_status_seen) {
+            self.program_status_seen = false;
+            self.surfaceMessageWriter(.{ .program_status = .{ .event = .reset_all } });
+        }
     }
 
     pub fn queryKittyKeyboard(self: *StreamHandler) !void {
@@ -1089,11 +1098,17 @@ pub const StreamHandler = struct {
                 self.surfaceMessageWriter(.{ .stop_command = code });
             },
 
+            // A new prompt (OSC 133;A) ends transient program status
+            // records. Only sent once the program used OSC 7501, so
+            // shells without it don't wake the surface on every prompt.
+            .fresh_line_new_prompt => if (self.program_status_seen) {
+                self.surfaceMessageWriter(.{ .program_status = .{ .event = .prompt } });
+            },
+
             // Handled by Terminal, no special handling by us
             .end_prompt_start_input,
             .end_prompt_start_input_terminate_eol,
             .fresh_line,
-            .fresh_line_new_prompt,
             .new_command,
             .prompt_start,
             => {},
@@ -1536,6 +1551,33 @@ pub const StreamHandler = struct {
     /// Display a GUI progress report.
     fn progressReport(self: *StreamHandler, report: terminal.osc.Command.ProgressReport) void {
         self.surfaceMessageWriter(.{ .progress_report = report });
+    }
+
+    fn programStatus(
+        self: *StreamHandler,
+        cmd: terminal.osc.Command.ProgramStatus,
+    ) !void {
+        switch (cmd) {
+            // The reply is always the same fixed bytes. The specification
+            // never allows sending report contents back to the program.
+            .query => |terminator| switch (terminator) {
+                inline else => |t| self.messageWriter(.{
+                    .write_stable = "\x1b]7501;?" ++ comptime t.string(),
+                }),
+            },
+
+            .report => |report| {
+                self.program_status_seen = true;
+                self.surfaceMessageWriter(.{ .program_status = .{
+                    .event = .report,
+                    .state = .init(report.state),
+                    .data = try apprt.surface.Message.WriteReq.init(
+                        self.alloc,
+                        report.data,
+                    ),
+                } });
+            },
+        }
     }
 };
 

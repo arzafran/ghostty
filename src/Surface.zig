@@ -1191,6 +1191,17 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .program_status => |v| {
+            defer v.data.deinit();
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .program_status,
+                .{ .event = v.event, .state = v.state, .data = v.data.slice() },
+            ) catch |err| {
+                log.warn("apprt failed to report program status err={}", .{err});
+            };
+        },
+
         .tmux_control => |v| {
             defer v.data.deinit();
             if (comptime @hasDecl(apprt.runtime.Surface, "tmuxControl")) {

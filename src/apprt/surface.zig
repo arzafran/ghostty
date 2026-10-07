@@ -127,6 +127,10 @@ pub const Message = union(enum) {
     /// Report the progress of an action using a GUI element
     progress_report: terminal.osc.Command.ProgressReport,
 
+    /// A program status report (OSC 7501), or a lifecycle event that
+    /// changes which program status records survive.
+    program_status: ProgramStatusMsg,
+
     /// Read-only tmux control-mode state for embedded runtimes.
     tmux_control: TmuxControlMsg,
 
@@ -151,6 +155,15 @@ pub const Message = union(enum) {
         csi_21_t,
 
         // This enum is a placeholder for future title styles.
+    };
+
+    pub const ProgramStatusMsg = struct {
+        event: apprt.action.ProgramStatus.Event,
+        state: apprt.action.ProgramStatus.State = .idle,
+
+        /// The report body after `7501;`, already validated by the
+        /// parser. Empty for events other than `report`.
+        data: WriteReq = .{ .stable = "" },
     };
 
     pub const TmuxControlMsg = struct {

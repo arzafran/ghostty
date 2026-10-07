@@ -794,6 +794,10 @@ pub const Application = extern struct {
             .search_total => Action.searchTotal(target, value),
             .search_selected => Action.searchSelected(target, value),
 
+            // Program status records are kept by embedders; the GTK
+            // app doesn't show them.
+            .program_status => return false,
+
             // Unimplemented
             .secure_input,
             .close_all_windows,

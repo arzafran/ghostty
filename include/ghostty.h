@@ -892,6 +892,33 @@ typedef struct {
   int8_t progress;
 } ghostty_action_progress_report_s;
 
+// apprt.action.ProgramStatus.Event
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_EVENT_REPORT,
+  GHOSTTY_PROGRAM_STATUS_EVENT_RESET_ALL,
+  GHOSTTY_PROGRAM_STATUS_EVENT_PROMPT,
+} ghostty_action_program_status_event_e;
+
+// apprt.action.ProgramStatus.State
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_STATE_IDLE,
+  GHOSTTY_PROGRAM_STATUS_STATE_WORKING,
+  GHOSTTY_PROGRAM_STATUS_STATE_DONE,
+  GHOSTTY_PROGRAM_STATUS_STATE_BLOCKED,
+  GHOSTTY_PROGRAM_STATUS_STATE_ERROR,
+  GHOSTTY_PROGRAM_STATUS_STATE_CLEAR,
+} ghostty_action_program_status_state_e;
+
+// apprt.action.ProgramStatus.C
+typedef struct {
+  ghostty_action_program_status_event_e event;
+  ghostty_action_program_status_state_e state;
+  // The OSC 7501 report body after "7501;", already validated. Not
+  // NUL-terminated and only valid for the duration of the callback.
+  const uint8_t* data;
+  uintptr_t len;
+} ghostty_action_program_status_s;
+
 // apprt.action.CommandFinished.C
 typedef struct {
   // -1 if no exit code was reported, otherwise 0-255
@@ -1001,6 +1028,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
+  GHOSTTY_ACTION_PROGRAM_STATUS,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1044,6 +1072,7 @@ typedef union {
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
   ghostty_action_open_config_e open_config;
+  ghostty_action_program_status_s program_status;
 } ghostty_action_u;
 
 typedef struct {
