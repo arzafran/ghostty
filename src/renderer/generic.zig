@@ -1198,9 +1198,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const display_link = self.display_link orelse return false;
             if (display_link.isRunning()) return true;
             if (!(self.visible and self.focused)) return false;
-            self.display_link_idle_since = null;
+            self.resetDisplayLinkIdle();
             display_link.start() catch return false;
             return true;
+        }
+
+        /// `drawFrame` reads and writes `display_link_idle_since` under
+        /// `draw_mutex`, and may run off the render thread (`Surface.draw`),
+        /// so render-thread resets take the same lock.
+        fn resetDisplayLinkIdle(self: *Self) void {
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            self.display_link_idle_since = null;
         }
 
         /// Note a display link tick with nothing to draw, and park the link
@@ -1284,7 +1293,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // because it is a waste of resources and we can move to pure
             // change-driven updates.
             if (self.visible and self.focused) {
-                self.display_link_idle_since = null;
+                self.resetDisplayLinkIdle();
                 display_link.start() catch {};
             } else {
                 display_link.stop() catch {};
