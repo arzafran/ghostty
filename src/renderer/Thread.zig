@@ -557,8 +557,9 @@ fn drawFrame(self: *Thread, now: bool) void {
     }
 
     // If the renderer is managing a vsync on its own, we only draw
-    // when we're forced to via `now`.
-    if (!now and self.renderer.hasVsync()) return;
+    // when we're forced to via `now`. A display link parked for being
+    // idle restarts here and draws the change on its next tick.
+    if (!now and self.renderer.resumeVsync()) return;
 
     if (must_draw_from_app_thread) {
         _ = self.app_mailbox.push(

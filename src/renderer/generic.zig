@@ -219,6 +219,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// don't support a display link.
         display_link: ?DisplayLink = null,
 
+        /// When the display link's current run of ticks with nothing to
+        /// draw began. After `display_link_park_ms` of that the link is
+        /// stopped until the next change, so an idle focused terminal
+        /// stops waking the render thread on every refresh.
+        display_link_idle_since: ?std.Io.Timestamp = null,
+
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
 
@@ -1176,6 +1182,41 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             return display_link.isRunning();
         }
 
+        /// How long a display link may tick with nothing to draw before it
+        /// is parked. Restarting a parked link adds a few milliseconds to
+        /// the next draw, so this outlasts the gap between keystrokes while
+        /// typing but stays under the 600ms cursor blink.
+        const display_link_park_ms = 250;
+
+        /// Like `hasVsync`, but first restarts a display link that was
+        /// parked for being idle, so the pending change is drawn on the
+        /// next refresh instead of without vsync.
+        ///
+        /// Must be called on the render thread.
+        pub fn resumeVsync(self: *Self) bool {
+            if (comptime DisplayLink == void) return false;
+            const display_link = self.display_link orelse return false;
+            if (display_link.isRunning()) return true;
+            if (!(self.visible and self.focused)) return false;
+            self.display_link_idle_since = null;
+            display_link.start() catch return false;
+            return true;
+        }
+
+        /// Note a display link tick with nothing to draw, and park the link
+        /// once the terminal has been idle for `display_link_park_ms`.
+        fn noteIdleFrame(self: *Self) void {
+            if (comptime DisplayLink == void) return;
+            const display_link = self.display_link orelse return;
+            const now: std.Io.Timestamp = .now(global.io(), .awake);
+            const since = self.display_link_idle_since orelse {
+                self.display_link_idle_since = now;
+                return;
+            };
+            if (since.durationTo(now).toMilliseconds() < display_link_park_ms) return;
+            if (display_link.isRunning()) display_link.stop() catch {};
+        }
+
         /// Callback when the focus changes for the terminal this is rendering.
         ///
         /// Must be called on the render thread.
@@ -1243,6 +1284,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // because it is a waste of resources and we can move to pure
             // change-driven updates.
             if (self.visible and self.focused) {
+                self.display_link_idle_since = null;
                 display_link.start() catch {};
             } else {
                 display_link.stop() catch {};
@@ -1707,9 +1749,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // apprt may be swapping buffers and display an outdated frame
                 // if we don't draw something new.
                 try self.api.presentLastTarget();
+                self.noteIdleFrame();
                 return;
             }
             self.cells_rebuilt = false;
+            self.display_link_idle_since = null;
 
             // Wait for a frame to be available.
             const frame = try self.swap_chain.nextFrame();
