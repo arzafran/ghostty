@@ -13,25 +13,16 @@ const PayloadKind = enum {
 };
 
 pub fn parse(parser: *Parser, _: ?u8) ?*Command {
-    const writer = parser.writer orelse {
+    const cap = if (parser.capture) |*c| c else {
         parser.state = .invalid;
         return null;
     };
 
-    // Ensure sentinel termination.
-    writer.writeByte(0) catch {
-        parser.state = .invalid;
-        return null;
-    };
-
-    var data = writer.buffered();
+    const data = cap.trailing();
     if (data.len == 0) {
         parser.state = .invalid;
         return null;
     }
-
-    // Drop sentinel.
-    data = data[0 .. data.len - 1];
 
     const meta_end = std.mem.indexOfScalar(u8, data, ';') orelse {
         parser.state = .invalid;
@@ -218,6 +209,7 @@ test "OSC 99: kitty notification with title and body chunks" {
     const title = "99;i=abc:d=0:p=title;Kitty Title";
     for (title) |ch| p.next(ch);
     try testing.expect(p.end('\x1b') == null);
+    p.reset();
 
     const body = "99;i=abc:p=body;Kitty Body";
     for (body) |ch| p.next(ch);
