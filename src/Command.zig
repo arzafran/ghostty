@@ -188,11 +188,17 @@ fn startPosix(self: *Command, arena: Allocator) !void {
     else
         @compileError("missing env vars");
 
+    var exec_attr = ExecAttr.init();
+
     // Fork.
-    const pid = try fork();
+    const pid = fork() catch |err| {
+        exec_attr.deinit();
+        return err;
+    };
 
     if (pid != 0) {
         // Parent, return immediately.
+        exec_attr.deinit();
         self.pid = @intCast(pid);
         if (self.rt_post_fork) |f| try f(self);
         return;
@@ -230,7 +236,7 @@ fn startPosix(self: *Command, arena: Allocator) !void {
         // offload to execve below.
         const file_slice = std.mem.sliceTo(self.path, 0);
         if (std.mem.findScalar(u8, file_slice, '/') != null) {
-            break :execve posix.errno(posix.system.execve(self.path, argsZ, envp));
+            break :execve exec_attr.exec(self.path, argsZ, envp);
         }
 
         var path_expanded_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -249,7 +255,7 @@ fn startPosix(self: *Command, arena: Allocator) !void {
             const full_path = path_expanded_buf[0..path_len :0].ptr;
             // Replace here, switch on error (any error means that replace
             // failed, but we might need to retry).
-            err = posix.errno(posix.system.execve(full_path, argsZ, envp));
+            err = exec_attr.exec(full_path, argsZ, envp);
             switch (err) {
                 .ACCES => seen_eacces = true,
                 .NOENT, .NOTDIR => {},
@@ -290,6 +296,64 @@ fn startPosix(self: *Command, arena: Allocator) !void {
     // we're in the child.
     return error.ExecFailedInChild;
 }
+
+/// How the child replaces its image after the pre-exec callbacks. On macOS it
+/// uses posix_spawn(POSIX_SPAWN_SETEXEC) with responsibility disclaimed, so
+/// the child becomes its own "responsible process". Without that, every
+/// shell and every app launched from one is attributed to the host app, and
+/// force quitting any of those apps makes macOS kill the host and all of its
+/// children. Built in the parent because dlsym and allocation are unsafe
+/// between fork and exec; elsewhere it is plain execve.
+const ExecAttr = struct {
+    const is_macos = builtin.os.tag == .macos;
+
+    attr: if (is_macos) ?std.c.posix_spawnattr_t else void = if (is_macos) null else {},
+
+    fn init() ExecAttr {
+        if (comptime !is_macos) return .{};
+
+        // Private libsystem SPI, also used by iTerm2. It is
+        // looked up at runtime so a macOS without it falls back to execve.
+        const rtld_default: ?*anyopaque = @ptrFromInt(std.math.maxInt(usize) - 1);
+        const sym = std.c.dlsym(rtld_default, "responsibility_spawnattrs_setdisclaim") orelse
+            return .{};
+        const setdisclaim: *const fn (*std.c.posix_spawnattr_t, c_int) callconv(.c) c_int =
+            @ptrCast(@alignCast(sym));
+
+        var attr: std.c.posix_spawnattr_t = undefined;
+        if (std.c.posix_spawnattr_init(&attr) != 0) return .{};
+        if (std.c.posix_spawnattr_setflags(&attr, .{ .SETEXEC = true }) != 0 or
+            setdisclaim(&attr, 1) != 0)
+        {
+            _ = std.c.posix_spawnattr_destroy(&attr);
+            return .{};
+        }
+        return .{ .attr = attr };
+    }
+
+    /// Parent only: the child never returns here except on exec failure.
+    fn deinit(self: *ExecAttr) void {
+        if (comptime !is_macos) return;
+        if (self.attr) |*attr| _ = std.c.posix_spawnattr_destroy(attr);
+        self.attr = null;
+    }
+
+    /// Replaces the process image. Returns only on failure, with the errno.
+    fn exec(
+        self: *const ExecAttr,
+        path: [*:0]const u8,
+        argv: [*:null]const ?[*:0]const u8,
+        envp: [*:null]const ?[*:0]const u8,
+    ) posix.E {
+        if (comptime is_macos) if (self.attr) |*attr| {
+            var pid: posix.pid_t = undefined;
+            // On success this does not return. On failure fall through to
+            // execve, which reports the errno the PATH search expects.
+            _ = std.c.posix_spawn(&pid, path, null, attr, argv, envp);
+        };
+        return posix.errno(posix.system.execve(path, argv, envp));
+    }
+};
 
 /// Wrapper for the raw fork syscall. This preserves the error handling from
 /// the std.posix wrapper that was removed in Zig 0.16.
