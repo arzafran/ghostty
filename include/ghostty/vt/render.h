@@ -19,79 +19,24 @@
 extern "C" {
 #endif
 
-/** @defgroup render Render State
+/** @addtogroup render
  *
- * Represents the state required to render a visible screen (a viewport)
- * of a terminal instance. This is stateful and optimized for repeated
- * updates from a single terminal instance and only updating dirty regions
- * of the screen.
+ * A render state is a copy of everything you need to draw one frame: the
+ * rows, the cells, the cursor, and the colors. It only needs the terminal
+ * during an update, so everything after that can happen while the terminal
+ * keeps working.
  *
- * The key design principle of this API is that it only needs read/write
- * access to the terminal instance during the update call. This allows
- * the render state to minimally impact terminal IO performance and also
- * allows the renderer to be safely multi-threaded (as long as a lock is 
- * held during the update call to ensure exclusive access to the terminal 
- * instance).
+ * Use this when you draw the terminal yourself.
  *
- * The basic usage of this API is:
+ * ## Example
  *
- *   1. Create an empty render state
- *   2. Update it from a terminal instance whenever you need.
- *   3. Read from the render state to get the data needed to draw your frame.
- *
- * ## Two-Phase Updates
- *
- * For callers that synchronize terminal access (e.g. a renderer thread
- * sharing a lock with an IO thread), the update can be split into two
- * phases to minimize the time the terminal must be held exclusively:
- * ghostty_render_state_begin_update requires terminal access, while
- * ghostty_render_state_end_update completes any deferred work using only
- * memory owned by the render state. A typical renderer would lock, begin
- * the update, unlock, and then end the update while the IO thread is free
- * to continue modifying the terminal. ghostty_render_state_update is a
- * convenience that performs both phases in one call.
- *
- * ## Dirty Tracking
- *
- * Dirty tracking is a key feature of the render state that allows renderers
- * to efficiently determine what parts of the screen have changed and only 
- * redraw changed regions.
- *
- * The render state API keeps track of dirty state at two independent layers:
- * a global dirty state that indicates whether the entire frame is clean, 
- * partially dirty, or fully dirty, and a per-row dirty state that allows 
- * tracking which rows in a partially dirty frame have changed. 
- *
- * The user of the render state API is expected to unset both of these.
- * The `update` call does not unset dirty state, it only updates it. After
- * successfully rendering a complete frame, use ghostty_render_state_clean()
- * to unset both layers in one call. The granular setters remain available
- * for callers that only consume part of a frame.
- *
- * An extremely important detail: setting one dirty state doesn't unset
- * the other. For example, setting the global dirty state to false does not
- * reset the row-level dirty flags. So, the caller of the render state API must
- * be careful to manage both layers of dirty state correctly. 
- *
- * ## Examples
- *
- * ### Creating and updating render state
  * @snippet c-vt-render/src/main.c render-state-update
  *
- * ### Checking dirty state
- * @snippet c-vt-render/src/main.c render-dirty-check
+ * Full program: @ref c-vt-render/src/main.c
  *
- * ### Reading colors
- * @snippet c-vt-render/src/main.c render-colors
- *
- * ### Reading cursor state
- * @snippet c-vt-render/src/main.c render-cursor
- *
- * ### Iterating rows and cells
- * @snippet c-vt-render/src/main.c render-row-iterate
- *
- * ### Resetting dirty state after rendering
- * @snippet c-vt-render/src/main.c render-dirty-reset
+ * See @ref guide-rendering for how to draw a frame, track what changed,
+ * respect render holds, and use overscan and row identity. See
+ * @ref guide-images for drawing images.
  *
  * @{
  */
@@ -114,24 +59,43 @@ typedef enum GHOSTTY_ENUM_TYPED {
 } GhosttyRenderStateDirty;
 
 /**
- * Visual style of the cursor.
+ * A number of rows above and below the viewport.
+ *
+ * This is used both to request overscan with
+ * GHOSTTY_RENDER_STATE_OPT_OVERSCAN and to report how many rows an
+ * update captured with GHOSTTY_RENDER_STATE_DATA_OVERSCAN. See
+ * @ref guide-rendering-overscan for how the extra rows are used.
  *
  * @ingroup render
  */
-typedef enum GHOSTTY_ENUM_TYPED {
-  /** Bar cursor (DECSCUSR 5, 6). */
-  GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR = 0,
+typedef struct {
+  /** Rows above the top of the viewport. */
+  uint16_t above;
 
-  /** Block cursor (DECSCUSR 1, 2). */
-  GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK = 1,
+  /** Rows below the bottom of the viewport. */
+  uint16_t below;
+} GhosttyRenderStateOverscan;
 
-  /** Underline cursor (DECSCUSR 3, 4). */
-  GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE = 2,
-
-  /** Hollow block cursor. */
-  GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW = 3,
-  GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
-} GhosttyRenderStateCursorVisualStyle;
+/**
+ * The identity of a row across render state updates.
+ *
+ * Treat this value as opaque. Two ids are the same when both words are
+ * equal. No other comparison or interpretation is meaningful, and the
+ * contents may change between library versions. A zero-initialized id is
+ * never valid, so it can be used to mean "no row".
+ *
+ * @code{.c}
+ * bool same = a.bits[0] == b.bits[0] && a.bits[1] == b.bits[1];
+ * @endcode
+ *
+ * See @ref guide-rendering-row-identity for how to use ids.
+ *
+ * @ingroup render
+ */
+typedef struct {
+  /** Opaque id data. Compare both words for equality. */
+  uint64_t bits[2];
+} GhosttyRenderStateRowId;
 
 /**
  * Queryable data kinds for ghostty_render_state_get().
@@ -145,7 +109,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
   /** Viewport width in cells (uint16_t). */
   GHOSTTY_RENDER_STATE_DATA_COLS = 1,
 
-  /** Viewport height in cells (uint16_t). */
+  /** Viewport height in cells (uint16_t). This does not include
+   *  overscan rows. */
   GHOSTTY_RENDER_STATE_DATA_ROWS = 2,
 
   /** Current dirty state (GhosttyRenderStateDirty). */
@@ -155,6 +120,10 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *  from the render state (GhosttyRenderStateRowIterator). Row data is
    *  only valid as long as the underlying render state is not updated.
    *  It is unsafe to use row data after updating the render state.
+   *
+   *  The iterator visits every row the last update captured, from top
+   *  to bottom. This is exactly the viewport unless overscan was
+   *  requested with GHOSTTY_RENDER_STATE_OPT_OVERSCAN.
    *  */
   GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR = 4,
 
@@ -165,8 +134,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_RENDER_STATE_DATA_COLOR_FOREGROUND = 6,
 
   /** Cursor color when explicitly set by terminal state (GhosttyColorRgb).
-   *  Returns GHOSTTY_INVALID_VALUE if no explicit cursor color is set;
-   *  use COLOR_CURSOR_HAS_VALUE to check first. */
+   *  Returns GHOSTTY_NO_VALUE if no explicit cursor color is set. */
   GHOSTTY_RENDER_STATE_DATA_COLOR_CURSOR = 7,
 
   /** Whether an explicit cursor color is set (bool). */
@@ -175,7 +143,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
   /** The active 256-color palette (GhosttyColorRgb[256]). */
   GHOSTTY_RENDER_STATE_DATA_COLOR_PALETTE = 9,
 
-  /** The visual style of the cursor (GhosttyRenderStateCursorVisualStyle). */
+  /** The visual style of the cursor (GhosttyCursorStyle). */
   GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE = 10,
 
   /** Whether the cursor is visible based on terminal modes (bool). */
@@ -188,19 +156,20 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_RENDER_STATE_DATA_CURSOR_PASSWORD_INPUT = 13,
 
   /** Whether the cursor is visible within the viewport (bool).
-   *  If false, the cursor viewport position values are undefined. */
+   *  If false, querying the cursor viewport position values returns
+   *  GHOSTTY_NO_VALUE. */
   GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE = 14,
 
   /** Cursor viewport x position in cells (uint16_t).
-   *  Only valid when CURSOR_VIEWPORT_HAS_VALUE is true. */
+   *  Returns GHOSTTY_NO_VALUE when CURSOR_VIEWPORT_HAS_VALUE is false. */
   GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X = 15,
 
   /** Cursor viewport y position in cells (uint16_t).
-   *  Only valid when CURSOR_VIEWPORT_HAS_VALUE is true. */
+   *  Returns GHOSTTY_NO_VALUE when CURSOR_VIEWPORT_HAS_VALUE is false. */
   GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y = 16,
 
   /** Whether the cursor is on the tail of a wide character (bool).
-   *  Only valid when CURSOR_VIEWPORT_HAS_VALUE is true. */
+   *  Returns GHOSTTY_NO_VALUE when CURSOR_VIEWPORT_HAS_VALUE is false. */
   GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_WIDE_TAIL = 17,
 
   /** All cursor state in one sized struct (GhosttyRenderStateCursor).
@@ -210,6 +179,38 @@ typedef enum GHOSTTY_ENUM_TYPED {
   /** All render-state colors in one sized struct (GhosttyRenderStateColors).
    *  Initialize the output with GHOSTTY_INIT_SIZED before querying. */
   GHOSTTY_RENDER_STATE_DATA_COLORS = 19,
+
+  /** How many overscan rows the last update captured on each side
+   *  (GhosttyRenderStateOverscan). This is never more than the request.
+   *  It is less when those rows don't exist: `above` is smaller near the
+   *  top of the scrollback, and `below` is zero while the viewport is
+   *  scrolled to the bottom. */
+  GHOSTTY_RENDER_STATE_DATA_OVERSCAN = 20,
+
+  /** The overscan request most recently set with
+   *  GHOSTTY_RENDER_STATE_OPT_OVERSCAN (GhosttyRenderStateOverscan).
+   *  The next update uses this request. Both sides are zero if it was
+   *  never set. */
+  GHOSTTY_RENDER_STATE_DATA_OVERSCAN_REQUEST = 21,
+
+  /** Populate an existing GhosttyRenderStateImageIterator with the image
+   *  placements found by the last update. See @ref guide-images-drawing. */
+  GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR = 22,
+
+  /** A value (uint64_t) that changes whenever an update changes the
+   *  placements that GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR returns. If
+   *  it matches the value from the last time you read the iterator, the
+   *  placements are the same and you don't need to read them again. See
+   *  @ref guide-images-changes for an example and for exactly when the
+   *  value changes.
+   *
+   *  The value belongs to the whole list. To know when the pixels of a
+   *  single image changed, use
+   *  GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION.
+   *
+   *  Only compare the value for equality. It is always 0 when Kitty
+   *  graphics are disabled. */
+  GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION = 23,
   GHOSTTY_RENDER_STATE_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateData;
 
@@ -219,10 +220,215 @@ typedef enum GHOSTTY_ENUM_TYPED {
  * @ingroup render
  */
 typedef enum GHOSTTY_ENUM_TYPED {
-  /** Set dirty state (GhosttyRenderStateDirty). */
-  GHOSTTY_RENDER_STATE_OPTION_DIRTY = 0,
-  GHOSTTY_RENDER_STATE_OPTION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+  /**
+   * Not a real option. ghostty_render_state_set() returns
+   * GHOSTTY_INVALID_VALUE for it. Its value is 0, so a zeroed or
+   * uninitialized variable is never mistaken for a real option.
+   */
+  GHOSTTY_RENDER_STATE_OPT_INVALID = 0,
+
+  /** Set dirty state (GhosttyRenderStateDirty). Each update sets this
+   *  value itself, so there is no default to restore and a NULL value
+   *  returns GHOSTTY_INVALID_VALUE. */
+  GHOSTTY_RENDER_STATE_OPT_DIRTY = 1,
+
+  /** Request overscan rows above and below the viewport
+   *  (GhosttyRenderStateOverscan). The request takes effect on the next
+   *  update and stays in effect until it is changed. Both sides are zero
+   *  by default, which captures only the viewport. A NULL value restores
+   *  that default. The rows of the last update can still be read after
+   *  changing the request. Expect a full redraw on the update after a
+   *  change. See @ref guide-rendering-overscan. */
+  GHOSTTY_RENDER_STATE_OPT_OVERSCAN = 2,
+  GHOSTTY_RENDER_STATE_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateOption;
+
+/**
+ * The image protocols that a terminal supports.
+ *
+ * The render state uses this to say which protocol each image placement
+ * came from (see GHOSTTY_RENDER_STATE_IMAGE_DATA_PROTOCOL). Use it to
+ * decide where to read the image's pixels. Unlike the other image types
+ * here, the name has no RenderState prefix, because the protocol isn't
+ * specific to the render state.
+ *
+ * New protocols may be added in later versions. Skip placements with a
+ * protocol you don't support.
+ *
+ * @ingroup render
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** The Kitty graphics protocol. Read the image with
+   *  ghostty_kitty_graphics_image(). */
+  GHOSTTY_IMAGE_PROTOCOL_KITTY = 0,
+  GHOSTTY_IMAGE_PROTOCOL_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyImageProtocol;
+
+/**
+ * The kinds of Kitty graphics placements in a render state's image list.
+ *
+ * Read with GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_KIND. Most renderers
+ * can draw every kind the same way. The kind is useful when you need to
+ * tell them apart, for example for debugging.
+ *
+ * @ingroup render
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** Part of a virtual placement: one run of neighboring placeholder
+   *  cells in a single row. It is always one row tall. */
+  GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_VIRTUAL = 0,
+
+  /** A placement that a program positioned relative to another
+   *  placement, its parent. Kitty graphics lets a program attach one
+   *  image to another so that they move together. The parent is either
+   *  a virtual or a fixed placement, possibly through a chain of other
+   *  relative placements.
+   *
+   *  With a virtual parent, the position depends on the placeholder
+   *  cells. It is measured from the top-left corner of the parent's
+   *  cells on screen. That is the leftmost column and the topmost row
+   *  that any of its cells use, which matches Kitty. If none of those
+   *  cells are in the captured rows (the viewport plus any overscan), the
+   *  relative placement is not included.
+   *
+   *  With a fixed parent, the position is measured from the parent's
+   *  cell. The relative placement is included at its full size when any
+   *  part of it is in the captured rows, even if the parent isn't, so it
+   *  may need to be clipped when drawn.
+   *
+   *  See @ref guide-images-relative. */
+  GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_RELATIVE = 1,
+
+  /** A placement at a cell on the screen. It scrolls with the text,
+   *  like a line of output would. Its z-index is the one the program
+   *  chose, so it can be in any layer.
+   *
+   *  It is included at its full size when any part of it is in the
+   *  captured rows, so it may need to be clipped when drawn. See
+   *  @ref guide-images-clipping. */
+  GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_FIXED = 2,
+  GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyRenderStateKittyPlacementKind;
+
+/**
+ * Data you can read about the current placement of an image iterator
+ * with ghostty_render_state_image_get().
+ *
+ * The type in parentheses is the type that the `out` pointer must point
+ * to. All pixel values use the cell size set with ghostty_terminal_resize().
+ *
+ * Some values only apply to one protocol, and have the protocol in their
+ * name. For example, GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_KIND only
+ * applies to Kitty graphics placements. Reading one of these for a
+ * placement from another protocol returns GHOSTTY_NO_VALUE.
+ *
+ * @ingroup render
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** Invalid value. Querying it returns GHOSTTY_INVALID_VALUE. */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_INVALID = 0,
+
+  /** The protocol the image came from (GhosttyImageProtocol). */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_PROTOCOL = 1,
+
+  /** The ID of the image to draw (uint32_t). IDs are only unique within
+   *  one protocol, so look the image up in the storage of its protocol.
+   *  For Kitty graphics, use ghostty_kitty_graphics_image(). */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_ID = 2,
+
+  /** The generation of the image's contents (uint64_t). It changes
+   *  whenever the image's pixels change, including when an animation
+   *  moves to a new frame. Use it as part of your texture cache key,
+   *  with the protocol and image ID: if it matches the texture you have,
+   *  you don't need to read the pixels again. For Kitty graphics, this
+   *  is the same value as GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_GENERATION.
+   *
+   *  To know when the list of placements as a whole changed, use
+   *  GHOSTTY_RENDER_STATE_DATA_IMAGE_PLACEMENTS_GENERATION. */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION = 3,
+
+  /** The layer to draw the image in (GhosttyImageLayer). */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_LAYER = 4,
+
+  /** The z-index (int32_t), which orders images within a layer. Images
+   *  with a lower z-index are drawn first. The value comes from the
+   *  image's protocol. For Kitty graphics, it is the z-index the program
+   *  asked for, and virtual placements are always -1. */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_Z = 5,
+
+  /** The column of the top-left cell (int32_t), where 0 is the leftmost
+   *  column of the viewport. Fixed and relative placements are reported
+   *  at their full size, so they can start to the left of the viewport,
+   *  which gives a negative value. Virtual placements never do. See
+   *  @ref guide-images-clipping. */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL = 6,
+
+  /** The row of the top-left cell (int32_t), where 0 is the top row of
+   *  the viewport. A placement in an overscan row above the viewport has
+   *  a negative row, the same as GHOSTTY_RENDER_STATE_ROW_DATA_VIEWPORT_Y.
+   *  Fixed and relative placements are reported at their full size, so
+   *  they can also start above the first overscan row. Virtual
+   *  placements are always inside the captured rows. See
+   *  @ref guide-images-clipping. */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW = 7,
+
+  /** The number of columns of cells the placement covers (uint32_t). */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_GRID_COLS = 8,
+
+  /** The number of rows of cells the placement covers (uint32_t). */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_GRID_ROWS = 9,
+
+  /** How far the image starts from the left edge of the top-left cell,
+   *  in pixels (uint32_t). For a virtual placement, an image that is
+   *  narrower than its cells is centered, so this can be larger than a
+   *  cell is wide. For fixed and relative placements, this is the offset
+   *  the program asked for, limited to less than one cell. */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_X = 10,
+
+  /** How far the image starts from the top edge of the top-left cell,
+   *  in pixels (uint32_t). For a virtual placement, an image that is
+   *  shorter than its cells is centered, so this can be larger than a
+   *  cell is tall. For fixed and relative placements, this is the offset
+   *  the program asked for, limited to less than one cell. */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_Y = 11,
+
+  /** The width to draw the image at, in pixels (uint32_t). */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_WIDTH = 12,
+
+  /** The height to draw the image at, in pixels (uint32_t). */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_HEIGHT = 13,
+
+  /** The left edge of the part of the image to draw, in image pixels
+   *  (uint32_t). */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_X = 14,
+
+  /** The top edge of the part of the image to draw, in image pixels
+   *  (uint32_t). */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_Y = 15,
+
+  /** The width of the part of the image to draw, in image pixels
+   *  (uint32_t). Scale it to PIXEL_WIDTH when drawing. */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_WIDTH = 16,
+
+  /** The height of the part of the image to draw, in image pixels
+   *  (uint32_t). Scale it to PIXEL_HEIGHT when drawing. */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_HEIGHT = 17,
+
+  /** Kitty graphics only: the placement ID (uint32_t), or 0 if there
+   *  isn't one.
+   *
+   *  For a virtual placement, this is the placement ID that the
+   *  placeholder cells ask for. Cells that don't ask for one show the
+   *  image's virtual placement, whichever it is, and report 0. For a
+   *  fixed or relative placement, this is the ID the program gave it, or
+   *  0 if it didn't give one. */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_PLACEMENT_ID = 18,
+
+  /** Kitty graphics only: the kind of placement
+   *  (GhosttyRenderStateKittyPlacementKind). */
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_KITTY_KIND = 19,
+  GHOSTTY_RENDER_STATE_IMAGE_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyRenderStateImageData;
 
 /**
  * Queryable data kinds for ghostty_render_state_row_get().
@@ -263,6 +469,18 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *  to the C header or without high FFI costs should use `ghostty_cell_get`.
    */
   GHOSTTY_RENDER_STATE_ROW_DATA_CELLS_RAW = 5,
+
+  /** The row's position relative to the top of the viewport (int32_t).
+   *  Viewport rows are 0 through rows - 1. Overscan rows above the
+   *  viewport are negative, and overscan rows below it start at rows.
+   *  Without overscan, this equals the y reported by
+   *  ghostty_render_state_row_iterator_next_dirty(). */
+  GHOSTTY_RENDER_STATE_ROW_DATA_VIEWPORT_Y = 6,
+
+  /** The row's identity across updates (GhosttyRenderStateRowId). This
+   *  works with or without overscan. See
+   *  @ref guide-rendering-row-identity. */
+  GHOSTTY_RENDER_STATE_ROW_DATA_ID = 7,
   GHOSTTY_RENDER_STATE_ROW_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateRowData;
 
@@ -272,17 +490,25 @@ typedef enum GHOSTTY_ENUM_TYPED {
  * @ingroup render
  */
 typedef enum GHOSTTY_ENUM_TYPED {
-  /** Set dirty state for the current row (bool). */
-  GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY = 0,
-  GHOSTTY_RENDER_STATE_ROW_OPTION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+  /**
+   * Not a real option. ghostty_render_state_row_set() returns
+   * GHOSTTY_INVALID_VALUE for it. Its value is 0, so a zeroed or
+   * uninitialized variable is never mistaken for a real option.
+   */
+  GHOSTTY_RENDER_STATE_ROW_OPT_INVALID = 0,
+
+  /** Set dirty state for the current row (bool). Each update sets this
+   *  value itself, so there is no default to restore and a NULL value
+   *  returns GHOSTTY_INVALID_VALUE. */
+  GHOSTTY_RENDER_STATE_ROW_OPT_DIRTY = 1,
+  GHOSTTY_RENDER_STATE_ROW_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateRowOption;
 
 /**
  * Row-local selection range.
  *
- * This struct uses the sized-struct ABI pattern. Initialize with
- * GHOSTTY_INIT_SIZED(GhosttyRenderStateRowSelection) before querying
- * GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION.
+ * This is a sized struct. Initialize it with GHOSTTY_INIT_SIZED() before
+ * querying GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION. See @ref sized-structs.
  *
  * Querying GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION returns GHOSTTY_NO_VALUE
  * if the current row does not intersect the current selection.
@@ -303,9 +529,8 @@ typedef struct {
 /**
  * Render-state cursor information.
  *
- * This struct uses the sized-struct ABI pattern. Initialize with
- * GHOSTTY_INIT_SIZED(GhosttyRenderStateCursor) before querying
- * GHOSTTY_RENDER_STATE_DATA_CURSOR.
+ * This is a sized struct. Initialize it with GHOSTTY_INIT_SIZED() before
+ * querying GHOSTTY_RENDER_STATE_DATA_CURSOR. See @ref sized-structs.
  *
  * When viewport_has_value is false, viewport_x, viewport_y, and wide_tail
  * contain undefined data and must not be read.
@@ -338,15 +563,14 @@ typedef struct {
   bool password_input;
 
   /** The visual style of the cursor. */
-  GhosttyRenderStateCursorVisualStyle visual_style;
+  GhosttyCursorStyle visual_style;
 } GhosttyRenderStateCursor;
 
 /**
  * Render-state color information.
  *
- * This struct uses the sized-struct ABI pattern. Initialize with
- * GHOSTTY_INIT_SIZED(GhosttyRenderStateColors) before querying
- * GHOSTTY_RENDER_STATE_DATA_COLORS.
+ * This is a sized struct. Initialize it with GHOSTTY_INIT_SIZED() before
+ * querying GHOSTTY_RENDER_STATE_DATA_COLORS. See @ref sized-structs.
  *
  * Example:
  * @code
@@ -381,11 +605,16 @@ typedef struct {
   GhosttyColorRgb palette[256];
 } GhosttyRenderStateColors;
 
+/** @name Lifecycle
+ * @{
+ */
+
 /**
  * Create a new render state instance.
  *
  * @param allocator Pointer to allocator, or NULL to use the default allocator
- * @param state Pointer to store the created render state handle
+ * @param state Pointer to store the created render state handle (NULL returns
+ *              GHOSTTY_INVALID_VALUE)
  * @return GHOSTTY_SUCCESS on success, GHOSTTY_OUT_OF_MEMORY on allocation
  * failure
  *
@@ -405,6 +634,12 @@ GHOSTTY_API GhosttyResult ghostty_render_state_new(const GhosttyAllocator* alloc
  * @ingroup render
  */
 GHOSTTY_API void ghostty_render_state_free(GhosttyRenderState state);
+
+/** @} */
+
+/** @name Updating
+ * @{
+ */
 
 /**
  * Update a render state instance from a terminal.
@@ -444,7 +679,7 @@ GHOSTTY_API GhosttyResult ghostty_render_state_update(GhosttyRenderState state,
  *
  * Work that doesn't require terminal access may be deferred to the end phase
  * to keep this call (and therefore lock hold time) as short as possible.
- * Callers must treat the render state as incomplete until
+ * You must treat the render state as incomplete until
  * ghostty_render_state_end_update is called.
  *
  * This consumes terminal/screen dirty state in the same way as the internal
@@ -494,6 +729,12 @@ GHOSTTY_API GhosttyResult ghostty_render_state_end_update(GhosttyRenderState sta
  */
 GHOSTTY_API GhosttyResult ghostty_render_state_clean(GhosttyRenderState state);
 
+/** @} */
+
+/** @name Reading State
+ * @{
+ */
+
 /**
  * Get a value from a render state.
  *
@@ -503,9 +744,11 @@ GHOSTTY_API GhosttyResult ghostty_render_state_clean(GhosttyRenderState state);
  * @param state The render state handle (NULL returns GHOSTTY_INVALID_VALUE)
  * @param data The data kind to query
  * @param[out] out Pointer to receive the queried value
- * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if `state` or
- *         `out` is NULL, `data` is not a recognized enum value, or a sized
- *         output struct is smaller than `sizeof(size_t)`
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_NO_VALUE if `data` has no
+ *         value right now, GHOSTTY_INVALID_VALUE if `state` or `out` is NULL
+ *         or a sized output struct is smaller than its base layout, or
+ *         GHOSTTY_UNSUPPORTED if `data` is not known to this version of the
+ *         library
  *
  * @ingroup render
  */
@@ -515,6 +758,12 @@ GHOSTTY_API GhosttyResult ghostty_render_state_get(GhosttyRenderState state,
 
 /**
  * Get multiple data fields from a render state in a single call.
+ *
+ * Use this when each call into the library is expensive, for example from
+ * WebAssembly or from another language through its foreign function
+ * interface. It reads every key in one call. From C in the same process it
+ * costs the same as calling ghostty_render_state_get() once per key, so use
+ * whichever reads better.
  *
  * Each element in the keys array specifies a data kind, and the
  * corresponding element in the values array receives the result.
@@ -530,7 +779,9 @@ GHOSTTY_API GhosttyResult ghostty_render_state_get(GhosttyRenderState state,
  *               documented output type)
  * @param[out] out_written On return, receives the number of values
  *             successfully written (may be NULL)
- * @return GHOSTTY_SUCCESS if all queries succeed
+ * @return GHOSTTY_SUCCESS if every key succeeds. Otherwise the result of the
+ *         first key that failed, for example GHOSTTY_UNSUPPORTED for a key
+ *         that is not known to this version of the library.
  *
  * @ingroup render
  */
@@ -547,18 +798,39 @@ GHOSTTY_API GhosttyResult ghostty_render_state_get_multi(
  * The `value` pointer must point to a value of the type corresponding to the
  * requested option kind (see GhosttyRenderStateOption).
  *
+ * Passing NULL for `value` restores the option's default. Options that
+ * have no default, such as GHOSTTY_RENDER_STATE_OPT_DIRTY, return
+ * GHOSTTY_INVALID_VALUE for NULL instead.
+ *
+ * @code{.c}
+ * GhosttyRenderStateOverscan overscan = { .above = 4, .below = 4 };
+ * ghostty_render_state_set(state, GHOSTTY_RENDER_STATE_OPT_OVERSCAN,
+ *                          &overscan);
+ *
+ * // Later, go back to capturing only the viewport.
+ * ghostty_render_state_set(state, GHOSTTY_RENDER_STATE_OPT_OVERSCAN, NULL);
+ * @endcode
+ *
  * @param state The render state handle (NULL returns GHOSTTY_INVALID_VALUE)
  * @param option The option to set
- * @param[in] value Pointer to the value to set (NULL returns
- *            GHOSTTY_INVALID_VALUE)
- * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if `state` or
- *         `value` is NULL
+ * @param[in] value Pointer to the value to set, or NULL to restore the
+ *            option's default
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if `state` is
+ *         NULL, `value` is out of range, or `value` is NULL for an option
+ *         with no default, or GHOSTTY_UNSUPPORTED if `option` is not known
+ *         to this version of the library
  *
  * @ingroup render
  */
 GHOSTTY_API GhosttyResult ghostty_render_state_set(GhosttyRenderState state,
                                        GhosttyRenderStateOption option,
                                        const void* value);
+
+/** @} */
+
+/** @name Rows
+ * @{
+ */
 
 /**
  * Create a new row iterator instance.
@@ -570,7 +842,7 @@ GHOSTTY_API GhosttyResult ghostty_render_state_set(GhosttyRenderState state,
  * @param allocator Pointer to allocator, or NULL to use the default allocator
  * @param[out] out_iterator On success, receives the created iterator handle
  * @return GHOSTTY_SUCCESS on success, GHOSTTY_OUT_OF_MEMORY on allocation
- *         failure
+ *         failure, GHOSTTY_INVALID_VALUE if @p out_iterator is NULL
  *
  * @ingroup render
  */
@@ -590,9 +862,12 @@ GHOSTTY_API void ghostty_render_state_row_iterator_free(GhosttyRenderStateRowIte
 /**
  * Move a render-state row iterator to the next row.
  *
- * Rows are visited contiguously in ascending viewport order, starting at
- * y = 0. Returns true if the iterator moved successfully and row data is
- * available to read at the new position.
+ * Rows are visited in order from top to bottom with no gaps. Without
+ * overscan, the first row is the top row of the viewport. With overscan,
+ * the first row is the highest captured row above the viewport (see
+ * GHOSTTY_RENDER_STATE_OPT_OVERSCAN). Returns true if the iterator
+ * moved successfully and row data is available to read at the new
+ * position.
  *
  * @param iterator The iterator handle to advance (may be NULL)
  * @return true if advanced to the next row, false if `iterator` is
@@ -612,9 +887,13 @@ GHOSTTY_API bool ghostty_render_state_row_iterator_next(GhosttyRenderStateRowIte
  * viewport order. This function does not clear any dirty state.
  *
  * @param iterator The iterator handle to advance (NULL returns false)
- * @param[out] out_y Receives the viewport y coordinate when true is returned
- *                   (NULL returns false); it is not modified when false is
- *                   returned
+ * @param[out] out_y Receives the row's position in the iterator when true
+ *                   is returned (NULL returns false). It is not modified
+ *                   when false is returned. Without overscan, this is the
+ *                   viewport y. With overscan, it counts from the highest
+ *                   captured row, so use
+ *                   GHOSTTY_RENDER_STATE_ROW_DATA_VIEWPORT_Y to place
+ *                   the row.
  * @return true if advanced to a row requiring a redraw, false if an argument
  *         is NULL or the iterator has reached the end of the effective dirty
  *         rows
@@ -637,8 +916,10 @@ GHOSTTY_API bool ghostty_render_state_row_iterator_next_dirty(
  * @param iterator The iterator handle to query (NULL returns GHOSTTY_INVALID_VALUE)
  * @param data The data kind to query
  * @param[out] out Pointer to receive the queried value
- * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if
- *         `iterator` is NULL or the iterator is not positioned on a row
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if `iterator` or
+ *         `out` is NULL or the iterator is not positioned on a row, or
+ *         GHOSTTY_UNSUPPORTED if `data` is not known to this version of the
+ *         library
  *
  * @ingroup render
  */
@@ -649,6 +930,12 @@ GHOSTTY_API GhosttyResult ghostty_render_state_row_get(
 
 /**
  * Get multiple data fields from the current row in a single call.
+ *
+ * Use this when each call into the library is expensive, for example from
+ * WebAssembly or from another language through its foreign function
+ * interface. It reads every key in one call. From C in the same process it
+ * costs the same as calling ghostty_render_state_row_get() once per key, so
+ * use whichever reads better.
  *
  * Each element in the keys array specifies a data kind, and the
  * corresponding element in the values array receives the result.
@@ -664,7 +951,9 @@ GHOSTTY_API GhosttyResult ghostty_render_state_row_get(
  *               documented output type)
  * @param[out] out_written On return, receives the number of values
  *             successfully written (may be NULL)
- * @return GHOSTTY_SUCCESS if all queries succeed
+ * @return GHOSTTY_SUCCESS if every key succeeds. Otherwise the result of the
+ *         first key that failed, for example GHOSTTY_UNSUPPORTED for a key
+ *         that is not known to this version of the library.
  *
  * @ingroup render
  */
@@ -686,10 +975,12 @@ GHOSTTY_API GhosttyResult ghostty_render_state_row_get_multi(
  *
  * @param iterator The iterator handle to update (NULL returns GHOSTTY_INVALID_VALUE)
  * @param option The option to set
- * @param[in] value Pointer to the value to set (NULL returns
- *            GHOSTTY_INVALID_VALUE)
- * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if
- *         `iterator` is NULL or the iterator is not positioned on a row
+ * @param[in] value Pointer to the value to set. Row options have no
+ *            default to restore, so NULL returns GHOSTTY_INVALID_VALUE.
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if `iterator` or
+ *         `value` is NULL or the iterator is not positioned on a row, or
+ *         GHOSTTY_UNSUPPORTED if `option` is not known to this version of the
+ *         library
  *
  * @ingroup render
  */
@@ -698,26 +989,7 @@ GHOSTTY_API GhosttyResult ghostty_render_state_row_set(
     GhosttyRenderStateRowOption option,
     const void* value);
 
-/**
- * Create a new row cells instance.
- *
- * All fields except the allocator are left undefined until populated
- * via ghostty_render_state_row_get() with
- * GHOSTTY_RENDER_STATE_ROW_DATA_CELLS.
- *
- * You can reuse this value repeatedly with ghostty_render_state_row_get() to 
- * avoid allocating a new cells container for every row.
- *
- * @param allocator Pointer to allocator, or NULL to use the default allocator
- * @param[out] out_cells On success, receives the created row cells handle
- * @return GHOSTTY_SUCCESS on success, GHOSTTY_OUT_OF_MEMORY on allocation
- *         failure
- *
- * @ingroup render
- */
-GHOSTTY_API GhosttyResult ghostty_render_state_row_cells_new(
-    const GhosttyAllocator* allocator,
-    GhosttyRenderStateRowCells* out_cells);
+/** @} */
 
 /**
  * Queryable data kinds for ghostty_render_state_row_cells_get().
@@ -738,31 +1010,57 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *  (uint32_t). Returns 0 if the cell has no text. */
   GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN = 3,
 
-  /** Write grapheme codepoints into a caller-provided buffer (uint32_t*).
-   *  The buffer must be at least graphemes_len elements. The base codepoint
-   *  is written first, followed by any extra codepoints. */
+  /**
+   * Copy the cell's grapheme codepoints into a buffer you provide
+   * (GhosttyCodepointBuffer).
+   *
+   * The base codepoint comes first, followed by any extra codepoints. Up
+   * to cap codepoints are written, and len is set to the total number of
+   * codepoints in the cell. If they do not all fit, this returns
+   * GHOSTTY_OUT_OF_SPACE and the buffer holds the first cap of them. A
+   * cell with no text returns GHOSTTY_SUCCESS with len set to 0.
+   *
+   * @code{.c}
+   * uint32_t codepoints[16];
+   * GhosttyCodepointBuffer graphemes = {.ptr = codepoints, .cap = 16};
+   * GhosttyResult result = ghostty_render_state_row_cells_get(
+   *     cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, &graphemes);
+   * if (result == GHOSTTY_OUT_OF_SPACE) {
+   *   // The cell has graphemes.len codepoints, but only the first 16
+   *   // were written. Retry with a larger buffer to get the rest.
+   * }
+   * @endcode
+   */
   GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF = 4,
 
   /** The resolved background color of the cell (GhosttyColorRgb).
    *  Flattens the three possible sources: content-tag bg_color_rgb,
    *  content-tag bg_color_palette (looked up in the palette), or the
-   *  style's bg_color. Returns GHOSTTY_INVALID_VALUE if the cell has
-   *  no background color, in which case the caller should use whatever
-   *  default background color it wants (e.g. the terminal background). */
+   *  style's bg_color.
+   *
+   *  Returns GHOSTTY_NO_VALUE if the cell has no background color of its
+   *  own. Draw it with your default background, such as the terminal's:
+   *
+   *  @code{.c}
+   *  GhosttyColorRgb bg;
+   *  GhosttyResult result = ghostty_render_state_row_cells_get(
+   *      cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg);
+   *  if (result == GHOSTTY_NO_VALUE) bg = colors.background;
+   *  @endcode
+   */
   GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR = 5,
 
   /** The resolved foreground color of the cell (GhosttyColorRgb).
    *  Resolves palette indices through the palette. Bold color handling
-   *  is not applied; the caller should handle bold styling separately.
-   *  Returns GHOSTTY_INVALID_VALUE if the cell has no explicit foreground
-   *  color, in which case the caller should use whatever default foreground
-   *  color it wants (e.g. the terminal foreground). */
+   *  is not applied; you should handle bold styling separately.
+   *  Returns GHOSTTY_NO_VALUE if the cell has no foreground color of its
+   *  own. Draw it with your default foreground, such as the terminal's. */
   GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR = 6,
 
   /** Whether the cell is contained within the current selection (bool).
    *  This returns true when the cell's column is within the current row's
    *  row-local selection range, and false otherwise. Rendering policy for
-   *  selected cells (colors, inversion, etc.) is left to the caller.
+   *  selected cells (colors, inversion, etc.) is left to you.
    *
    *  Renderers that can draw cells in spans may be more efficient querying
    *  GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION once per row and applying that
@@ -790,6 +1088,31 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8 = 9,
   GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateRowCellsData;
+
+/** @name Cells
+ * @{
+ */
+
+/**
+ * Create a new row cells instance.
+ *
+ * All fields except the allocator are left undefined until populated
+ * via ghostty_render_state_row_get() with
+ * GHOSTTY_RENDER_STATE_ROW_DATA_CELLS.
+ *
+ * You can reuse this value repeatedly with ghostty_render_state_row_get() to 
+ * avoid allocating a new cells container for every row.
+ *
+ * @param allocator Pointer to allocator, or NULL to use the default allocator
+ * @param[out] out_cells On success, receives the created row cells handle
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_OUT_OF_MEMORY on allocation
+ *         failure, GHOSTTY_INVALID_VALUE if @p out_cells is NULL
+ *
+ * @ingroup render
+ */
+GHOSTTY_API GhosttyResult ghostty_render_state_row_cells_new(
+    const GhosttyAllocator* allocator,
+    GhosttyRenderStateRowCells* out_cells);
 
 /**
  * Move a render-state row cells iterator to the next cell.
@@ -834,8 +1157,10 @@ GHOSTTY_API GhosttyResult ghostty_render_state_row_cells_select(
  * @param cells The row cells handle to query (NULL returns GHOSTTY_INVALID_VALUE)
  * @param data The data kind to query
  * @param[out] out Pointer to receive the queried value
- * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if
- *         `cells` is NULL or the iterator is not positioned on a cell
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_NO_VALUE if the cell has no
+ *         value for `data`, GHOSTTY_INVALID_VALUE if `cells` is NULL or the
+ *         iterator is not positioned on a cell, or GHOSTTY_UNSUPPORTED if
+ *         `data` is not known to this version of the library
  *
  * @ingroup render
  */
@@ -846,6 +1171,12 @@ GHOSTTY_API GhosttyResult ghostty_render_state_row_cells_get(
 
 /**
  * Get multiple data fields from the current cell in a single call.
+ *
+ * Use this when each call into the library is expensive, for example from
+ * WebAssembly or from another language through its foreign function
+ * interface. It reads every key in one call. From C in the same process it
+ * costs the same as calling ghostty_render_state_row_cells_get() once per
+ * key, so use whichever reads better.
  *
  * Each element in the keys array specifies a data kind, and the
  * corresponding element in the values array receives the result.
@@ -861,7 +1192,9 @@ GHOSTTY_API GhosttyResult ghostty_render_state_row_cells_get(
  *               documented output type)
  * @param[out] out_written On return, receives the number of values
  *             successfully written (may be NULL)
- * @return GHOSTTY_SUCCESS if all queries succeed
+ * @return GHOSTTY_SUCCESS if every key succeeds. Otherwise the result of the
+ *         first key that failed, for example GHOSTTY_UNSUPPORTED for a key
+ *         that is not known to this version of the library.
  *
  * @ingroup render
  */
@@ -880,6 +1213,127 @@ GHOSTTY_API GhosttyResult ghostty_render_state_row_cells_get_multi(
  * @ingroup render
  */
 GHOSTTY_API void ghostty_render_state_row_cells_free(GhosttyRenderStateRowCells cells);
+
+/** @} */
+
+/** @name Images
+ * @{
+ */
+
+/**
+ * Create a new image iterator.
+ *
+ * The iterator starts out empty. Fill it from a render state with
+ * ghostty_render_state_get() and GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR.
+ * You can keep one iterator for the lifetime of your renderer and fill it
+ * again after every update. See @ref guide-images-drawing for a complete
+ * example.
+ *
+ * @param allocator Pointer to allocator, or NULL to use the default allocator
+ * @param[out] out_iterator On success, receives the created iterator handle
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_OUT_OF_MEMORY on allocation
+ *         failure, GHOSTTY_INVALID_VALUE if @p out_iterator is NULL
+ *
+ * @ingroup render
+ */
+GHOSTTY_API GhosttyResult ghostty_render_state_image_iterator_new(
+    const GhosttyAllocator* allocator,
+    GhosttyRenderStateImageIterator* out_iterator);
+
+/**
+ * Free an image iterator.
+ *
+ * @param iterator The iterator handle to free (may be NULL)
+ *
+ * @ingroup render
+ */
+GHOSTTY_API void ghostty_render_state_image_iterator_free(
+    GhosttyRenderStateImageIterator iterator);
+
+/**
+ * Move an image iterator to the next image placement.
+ *
+ * Call this before reading the first placement, and keep calling it
+ * until it returns false.
+ *
+ * The order of placements is not the order to draw them in. Sort them
+ * by layer (GHOSTTY_RENDER_STATE_IMAGE_DATA_LAYER) and then by z-index
+ * (GHOSTTY_RENDER_STATE_IMAGE_DATA_Z) first.
+ *
+ * Only placements with something to draw are returned. For example,
+ * placements of an image the terminal hasn't fully received yet are
+ * skipped.
+ *
+ * The iterator reads from the render state that filled it. After the
+ * next update of that render state, fill the iterator again before
+ * using it.
+ *
+ * @param iterator The iterator handle (NULL returns false)
+ * @return true if the iterator moved to a placement, false if there are
+ *         no more placements
+ *
+ * @ingroup render
+ */
+GHOSTTY_API bool ghostty_render_state_image_iterator_next(
+    GhosttyRenderStateImageIterator iterator);
+
+/**
+ * Read one value from the current placement of an image iterator.
+ *
+ * The `out` pointer must point to a value of the type listed for `data`
+ * in GhosttyRenderStateImageData. To read several values at once, use
+ * ghostty_render_state_image_get_multi().
+ *
+ * @param iterator The iterator handle, moved to a placement with
+ *        ghostty_render_state_image_iterator_next()
+ * @param data The value to read
+ * @param[out] out Pointer that receives the value
+ * @return GHOSTTY_SUCCESS on success. GHOSTTY_NO_VALUE if `data` only applies
+ *         to another protocol. GHOSTTY_INVALID_VALUE if the iterator is NULL
+ *         or is not on a placement. GHOSTTY_UNSUPPORTED if `data` is not known
+ *         to this version of the library.
+ *
+ * @ingroup render
+ */
+GHOSTTY_API GhosttyResult ghostty_render_state_image_get(
+    GhosttyRenderStateImageIterator iterator,
+    GhosttyRenderStateImageData data,
+    void* out);
+
+/**
+ * Read several values from the current placement of an image iterator in
+ * one call.
+ *
+ * Use this when each call into the library is expensive, for example from
+ * WebAssembly or from another language through its foreign function
+ * interface. It reads every key in one call. From C in the same process it
+ * costs the same as calling ghostty_render_state_image_get() once per key,
+ * so use whichever reads better.
+ *
+ * `values[i]` receives the value for `keys[i]`. The keys are read in
+ * order, and reading stops at the first error.
+ *
+ * @param iterator The iterator handle, moved to a placement with
+ *        ghostty_render_state_image_iterator_next()
+ * @param count The number of keys and values
+ * @param keys The values to read
+ * @param values Output pointers, one for each key
+ * @param[out] out_written If not NULL, receives the number of values
+ *             written before any error
+ * @return GHOSTTY_SUCCESS if every key succeeds. Otherwise the result of the
+ *         first key that failed, for example GHOSTTY_UNSUPPORTED for a key
+ *         that is not known to this version of the library.
+ *
+ * @ingroup render
+ */
+GHOSTTY_API GhosttyResult ghostty_render_state_image_get_multi(
+    GhosttyRenderStateImageIterator iterator,
+    size_t count,
+    const GhosttyRenderStateImageData* keys,
+    void** values,
+    size_t* out_written);
+
+/** @} */
 
 /** @} */
 

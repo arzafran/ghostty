@@ -68,6 +68,8 @@ pub fn run(alloc: Allocator) !u8 {
                 rgb.b,
             });
         }
+
+        try writer.flush();
     }
 
     return 0;
@@ -90,7 +92,7 @@ fn prettyPrint(alloc: Allocator, keys: [][]const u8) !u8 {
     try tty.writer().writeAll(vaxis.ctlseqs.unicode_set);
     defer tty.writer().writeAll(vaxis.ctlseqs.unicode_reset) catch {};
 
-    const winsize: vaxis.Winsize = switch (builtin.os.tag) {
+    const winsize: vaxis.Winsize = switch (builtin.target.os.tag) {
         // We use some default, it doesn't really matter for what
         // we're doing because we don't do any wrapping.
         .windows => .{
@@ -162,8 +164,7 @@ fn prettyPrint(alloc: Allocator, keys: [][]const u8) !u8 {
             );
             // rgb triple
             result = win.printSegment(.{
-                .text = try std.fmt.allocPrint(
-                    alloc,
+                .text = try alloc.print(
                     "#{x:0>2}{x:0>2}{x:0>2}",
                     .{
                         rgb.r, rgb.g, rgb.b,

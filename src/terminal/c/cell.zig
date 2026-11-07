@@ -89,6 +89,8 @@ pub const CellData = enum(c_int) {
     /// Output type: GhosttyColorRgb *
     color_rgb = 11,
 
+    _,
+
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: CellData) type {
         return switch (self) {
@@ -101,6 +103,7 @@ pub const CellData = enum(c_int) {
             .semantic_content => SemanticContent,
             .color_palette => u8,
             .color_rgb => color.RGB.C,
+            _ => void,
         };
     }
 };
@@ -110,18 +113,14 @@ pub fn get(
     data: CellData,
     out: ?*anyopaque,
 ) callconv(lib.calling_conv) Result {
-    if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(CellData, @intFromEnum(data)) orelse {
-            return .invalid_value;
-        };
-    }
-
+    if (comptime !lib.feature(.grid_introspection)) return .unsupported;
     return switch (data) {
         .invalid => .invalid_value,
+        _ => .unsupported,
         inline else => |comptime_data| getTyped(
             cell_,
             comptime_data,
-            @ptrCast(@alignCast(out)),
+            @ptrCast(@alignCast(out orelse return .invalid_value)),
         ),
     };
 }
@@ -133,6 +132,7 @@ pub fn get_multi(
     values: ?[*]?*anyopaque,
     out_written: ?*usize,
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.grid_introspection)) return .unsupported;
     const k = keys orelse return .invalid_value;
     const v = values orelse return .invalid_value;
 
@@ -156,19 +156,20 @@ fn getTyped(
     switch (data) {
         .invalid => return .invalid_value,
         .codepoint => out.* = @intCast(cell.codepoint()),
-        .content_tag => out.* = @enumFromInt(@intFromEnum(cell.content_tag)),
-        .wide => out.* = @enumFromInt(@intFromEnum(cell.wide)),
+        .content_tag => out.* = @fromBackingInt(@backingInt(cell.content_tag)),
+        .wide => out.* = @fromBackingInt(@backingInt(cell.wide)),
         .has_text => out.* = cell.hasText(),
         .has_styling => out.* = cell.hasStyling(),
         .style_id => out.* = cell.style_id,
         .has_hyperlink => out.* = cell.hyperlink,
         .protected => out.* = cell.protected,
-        .semantic_content => out.* = @enumFromInt(@intFromEnum(cell.semantic_content)),
+        .semantic_content => out.* = @fromBackingInt(@backingInt(cell.semantic_content)),
         .color_palette => out.* = cell.content.color_palette.data,
         .color_rgb => {
             const rgb = cell.content.color_rgb;
             out.* = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b };
         },
+        _ => comptime unreachable,
     }
 
     return .success;

@@ -237,19 +237,19 @@ extension Ghostty.SplitFocusDirection {
 }
 
 extension Ghostty {
+    /// One representation of clipboard contents. The data is binary-safe;
+    /// textual consumers use `string`.
     struct ClipboardContent {
         let mime: String
-        let data: String
+        let data: Data
 
-        static func from(content: ghostty_clipboard_content_s) -> ClipboardContent? {
-            guard let mimePtr = content.mime,
-                  let dataPtr = content.data else {
-                return nil
-            }
+        /// The data as text, if it is valid UTF-8.
+        var string: String? { String(data: data, encoding: .utf8) }
 
-            return ClipboardContent(
-                mime: String(cString: mimePtr),
-                data: String(cString: dataPtr)
+        static func from(content: ghostty_clipboard_content_s) -> ClipboardContent {
+            ClipboardContent(
+                mime: String(cString: content.mime),
+                data: Data(bytes: content.data, count: content.len)
             )
         }
     }

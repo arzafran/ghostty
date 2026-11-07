@@ -15,7 +15,7 @@ pub fn addInstrumentedExe(
     );
 
     const afl_cc = b.addSystemCommand(&.{
-        b.findProgram(&.{"afl-cc"}, &.{}) catch
+        b.findProgram(.{ .names = &.{"afl-cc"} }) orelse
             @panic("Could not find 'afl-cc', which is required to build"),
         "-O3",
     });
@@ -24,6 +24,19 @@ pub fn addInstrumentedExe(
         // AFL's LLVM instrumentation when linking our Zig-produced bitcode.
         // lld links the same inputs without issue.
         afl_cc.addArg("-fuse-ld=lld");
+
+        // Zig resolves the host target to the exact macOS point release
+        // (e.g. 27.0.1) for the bundled compiler-rt archive, whereas clang
+        // defaults to the SDK's major.minor version (e.g. 27.0.0), causing
+        // lld to warn about object version mismatches.
+        //
+        // Zig spells the LLVM bitcode triple differently from clang
+        // (i.e. `aarch64` for Zig vs `arm64` for clang),
+        // triggering -Woverride-module.
+        //
+        const min_ver = obj.rootModuleTarget().os.version_range.semver.min;
+        afl_cc.addArg(b.fmt("-mmacos-version-min={f}", .{min_ver}));
+        afl_cc.addArg("-Wno-override-module");
     }
     afl_cc.addArg("-o");
     const fuzz_exe = afl_cc.addOutputFileArg(obj.name);
@@ -62,7 +75,7 @@ pub fn addFuzzerRun(
     output_dir: std.Build.LazyPath,
 ) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{
-        b.findProgram(&.{"afl-fuzz"}, &.{}) catch
+        b.findProgram(.{ .names = &.{"afl-fuzz"} }) orelse
             @panic("Could not find 'afl-fuzz', which is required to run"),
         "-i",
     });

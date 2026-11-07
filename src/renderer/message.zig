@@ -76,6 +76,11 @@ pub const Message = union(enum) {
     /// `defunct` state), so it is only ever pushed `.forever` from macOS, never
     /// dropped — see `ghostty_surface_set_renderer_realized`.
     display_realized: bool,
+    /// Updates the health of the current presentation state.
+    ///
+    /// If unhealthy, then somehow the apprt failed to present frames from
+    /// the renderer. On GTK, this can be caused by failing to import a DMABUF.
+    presentation_health: renderer.Health,
 
     pub const SearchMatches = struct {
         arena: ArenaAllocator,

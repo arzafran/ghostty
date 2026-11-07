@@ -46,6 +46,7 @@ const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialo
 const GlobalShortcuts = @import("global_shortcuts.zig").GlobalShortcuts;
 const OpenURI = @import("../portal.zig").OpenURI;
 const media = @import("../media.zig");
+const Overrides = @import("Overrides.zig");
 
 const log = std.log.scoped(.gtk_ghostty_application);
 
@@ -178,6 +179,9 @@ pub const Application = extern struct {
         /// The configuration for the application.
         config: *Config,
 
+        /// The application window theme selected for this session.
+        window_theme_override: apprt.action.WindowTheme = .config,
+
         /// State and logic for the underlying windowing protocol.
         winproto: winprotopkg.App,
 
@@ -193,6 +197,11 @@ pub const Application = extern struct {
         /// should exit and the application should quit. This must
         /// only be set by the main loop thread.
         running: bool = false,
+
+        /// True once we've told systemd that startup is complete. Reloads
+        /// before then (e.g. syncing the color scheme during startup) must
+        /// not notify systemd, or it sees READY=1 before we're ready.
+        systemd_ready: bool = false,
 
         /// The timer used to quit the application after the last window is
         /// closed. Even if there is no quit delay set, this is the state
@@ -215,7 +224,7 @@ pub const Application = extern struct {
         css_provider: *gtk.CssProvider,
 
         /// Providers for loading custom stylesheets defined by user
-        custom_css_providers: std.ArrayListUnmanaged(*gtk.CssProvider) = .empty,
+        custom_css_providers: std.ArrayList(*gtk.CssProvider) = .empty,
 
         /// A copy of the LANG environment variable that was provided to Ghostty
         /// by the system. If this is null, the LANG environment variable did
@@ -255,7 +264,7 @@ pub const Application = extern struct {
     pub fn new(
         rt_app: *ApprtApp,
         core_app: *CoreApp,
-    ) Allocator.Error!*Self {
+    ) (error{ GtkMinimumVersion, AdwaitaMinimumVersion } || Allocator.Error)!*Self {
         const alloc = core_app.alloc;
 
         // Capture GLib/GObject/GTK log messages and funnel them through Zig's
@@ -263,8 +272,8 @@ pub const Application = extern struct {
         _ = glib.logSetWriterFunc(glibLogWriterFunction, null, null);
 
         // Log our GTK versions
-        gtk_version.logVersion();
-        adw_version.logVersion();
+        try gtk_version.logVersion();
+        try adw_version.logVersion();
 
         // Load our configuration.
         var config = CoreConfig.load(alloc) catch |err| err: {
@@ -555,6 +564,7 @@ pub const Application = extern struct {
 
         // Tell systemd that we are ready.
         systemd.notify.ready();
+        priv.systemd_ready = true;
 
         log.debug("entering runloop", .{});
         defer log.debug("exiting runloop", .{});
@@ -757,9 +767,13 @@ pub const Application = extern struct {
 
             .reload_config => try Action.reloadConfig(self, target, value),
 
+            .set_window_theme => Action.setWindowTheme(self, value),
+
             .render => Action.render(target),
 
             .resize_split => return Action.resizeSplit(target, value),
+
+            .resize_window => return Action.resizeWindow(target, value),
 
             .ring_bell => Action.ringBell(target),
 
@@ -777,6 +791,8 @@ pub const Application = extern struct {
             .show_gtk_inspector => Action.showGtkInspector(),
 
             .size_limit => return Action.sizeLimit(target, value),
+
+            .cell_size => return Action.cellSize(target, value),
 
             .toggle_maximize => Action.toggleMaximize(target),
             .toggle_fullscreen => Action.toggleFullscreen(target),
@@ -804,7 +820,6 @@ pub const Application = extern struct {
             .float_window,
             .toggle_visibility,
             .toggle_background_opacity,
-            .cell_size,
             .render_inspector,
             .renderer_health,
             .color_change,
@@ -899,102 +914,6 @@ pub const Application = extern struct {
 
         const writer = &buf.writer;
 
-        // Load standard css first as it can override some of the user configured styling.
-        try loadRuntimeCss414(config, writer);
-        try loadRuntimeCss416(config, writer);
-
-        const unfocused_fill: CoreConfig.Color = config.@"unfocused-split-fill" orelse config.background;
-
-        try writer.print(
-            \\widget.unfocused-split {{
-            \\ opacity: {d:.2};
-            \\ background-color: rgb({d},{d},{d});
-            \\}}
-            \\
-        , .{
-            1.0 - config.@"unfocused-split-opacity",
-            unfocused_fill.r,
-            unfocused_fill.g,
-            unfocused_fill.b,
-        });
-
-        if (config.@"split-divider-color") |color| {
-            try writer.print(
-                \\.window .split paned > separator {{
-                \\  color: rgb({[r]d},{[g]d},{[b]d});
-                \\  background: rgb({[r]d},{[g]d},{[b]d});
-                \\}}
-                \\
-            , .{
-                .r = color.r,
-                .g = color.g,
-                .b = color.b,
-            });
-        }
-
-        if (config.@"window-title-font-family") |font_family| {
-            try writer.print(
-                \\.window headerbar {{
-                \\  font-family: "{[font_family]s}";
-                \\}}
-                \\
-            , .{ .font_family = font_family });
-        }
-
-        const contents = buf.written();
-
-        log.debug("runtime CSS is {d} bytes", .{contents.len});
-
-        const bytes = glib.Bytes.new(contents.ptr, contents.len);
-        defer bytes.unref();
-
-        // Clears any previously loaded CSS from this provider
-        priv.css_provider.loadFromBytes(bytes);
-    }
-
-    /// Load runtime CSS for older than GTK 4.16
-    fn loadRuntimeCss414(
-        config: *const CoreConfig,
-        writer: *std.Io.Writer,
-    ) std.Io.Writer.Error!void {
-        if (gtk_version.runtimeAtLeast(4, 16, 0)) return;
-
-        const window_theme = config.@"window-theme";
-        const headerbar_background = config.@"window-titlebar-background" orelse config.background;
-        const headerbar_foreground = config.@"window-titlebar-foreground" orelse config.foreground;
-
-        switch (window_theme) {
-            .ghostty => try writer.print(
-                \\windowhandle {{
-                \\  background-color: rgb({d},{d},{d});
-                \\  color: rgb({d},{d},{d});
-                \\}}
-                \\windowhandle:backdrop {{
-                \\ background-color: oklab(from rgb({d},{d},{d}) calc(l * 0.9) a b / alpha);
-                \\}}
-                \\
-            , .{
-                headerbar_background.r,
-                headerbar_background.g,
-                headerbar_background.b,
-                headerbar_foreground.r,
-                headerbar_foreground.g,
-                headerbar_foreground.b,
-                headerbar_background.r,
-                headerbar_background.g,
-                headerbar_background.b,
-            }),
-            else => {},
-        }
-    }
-
-    /// Load runtime for GTK 4.16 and newer
-    fn loadRuntimeCss416(
-        config: *const CoreConfig,
-        writer: *std.Io.Writer,
-    ) std.Io.Writer.Error!void {
-        if (gtk_version.runtimeUntil(4, 16, 0)) return;
-
         const window_theme = config.@"window-theme";
         const headerbar_background = config.@"window-titlebar-background" orelse config.background;
         const headerbar_foreground = config.@"window-titlebar-foreground" orelse config.foreground;
@@ -1086,7 +1005,7 @@ pub const Application = extern struct {
             \\
         );
 
-        switch (window_theme) {
+        if (priv.window_theme_override == .config) switch (window_theme) {
             .ghostty => try writer.print(
                 \\:root {{
                 \\  --ghostty-fg: rgb({d},{d},{d});
@@ -1100,6 +1019,10 @@ pub const Application = extern struct {
                 \\  --popover-bg-color: var(--ghostty-bg);
                 \\  --window-fg-color: var(--ghostty-fg);
                 \\  --window-bg-color: var(--ghostty-bg);
+                \\}}
+                \\listview.command-palette-view {{
+                \\  --view-fg-color: var(--ghostty-fg);
+                \\  --view-bg-color: var(--ghostty-bg);
                 \\}}
                 \\windowhandle {{
                 \\  background-color: var(--headerbar-bg-color);
@@ -1117,7 +1040,55 @@ pub const Application = extern struct {
                 headerbar_background.b,
             }),
             else => {},
+        };
+
+        const unfocused_fill: CoreConfig.Color = config.@"unfocused-split-fill" orelse config.background;
+
+        try writer.print(
+            \\widget.unfocused-split {{
+            \\ opacity: {d:.2};
+            \\ background-color: rgb({d},{d},{d});
+            \\}}
+            \\
+        , .{
+            1.0 - config.@"unfocused-split-opacity",
+            unfocused_fill.r,
+            unfocused_fill.g,
+            unfocused_fill.b,
+        });
+
+        if (config.@"split-divider-color") |color| {
+            try writer.print(
+                \\.window .split paned > separator {{
+                \\  color: rgb({[r]d},{[g]d},{[b]d});
+                \\  background: rgb({[r]d},{[g]d},{[b]d});
+                \\}}
+                \\
+            , .{
+                .r = color.r,
+                .g = color.g,
+                .b = color.b,
+            });
         }
+
+        if (config.@"window-title-font-family") |font_family| {
+            try writer.print(
+                \\.window headerbar {{
+                \\  font-family: "{[font_family]s}";
+                \\}}
+                \\
+            , .{ .font_family = font_family });
+        }
+
+        const contents = buf.written();
+
+        log.debug("runtime CSS is {d} bytes", .{contents.len});
+
+        const bytes = glib.Bytes.new(contents.ptr, contents.len);
+        defer bytes.unref();
+
+        // Clears any previously loaded CSS from this provider
+        priv.css_provider.loadFromBytes(bytes);
     }
 
     const LoadCustomCssError = std.Io.File.OpenError ||
@@ -1327,7 +1298,7 @@ pub const Application = extern struct {
     ) callconv(.c) void {
         const location = css_section.toString();
         defer glib.free(location);
-        if (comptime gtk_version.atLeast(4, 16, 0)) bytes: {
+        bytes: {
             const bytes = css_section.getBytes() orelse break :bytes;
             var len: usize = undefined;
             const ptr = bytes.getData(&len) orelse break :bytes;
@@ -1379,11 +1350,13 @@ pub const Application = extern struct {
         // Setup our event loop
         self.startupXev();
 
+        // Setup some signal handlers. This must happen before anything
+        // that might notify systemd, since with Type=notify-reload systemd
+        // refuses to start us if our reload signal has no handler.
+        self.startupSignals();
+
         // Setup our style manager (light/dark mode)
         self.startupStyleManager();
-
-        // Setup some signal handlers
-        self.startupSignals();
 
         // Setup our action map
         self.startupActionMap();
@@ -1436,19 +1409,8 @@ pub const Application = extern struct {
         const config = priv.config.get();
 
         // Setup our initial light/dark
+        self.syncStyleManager(config);
         const style = self.as(adw.Application).getStyleManager();
-        style.setColorScheme(switch (config.@"window-theme") {
-            .auto, .ghostty => auto: {
-                const lum = config.background.toTerminalRGB().perceivedLuminance();
-                break :auto if (lum > 0.5)
-                    .prefer_light
-                else
-                    .prefer_dark;
-            },
-            .system => .prefer_light,
-            .dark => .force_dark,
-            .light => .force_light,
-        });
 
         // Setup color change notifications
         _ = gobject.Object.signals.notify.connect(
@@ -1465,12 +1427,48 @@ pub const Application = extern struct {
         handleStyleManagerDark(style, undefined, self);
     }
 
+    fn syncStyleManager(self: *Self, config: *const CoreConfig) void {
+        self.as(adw.Application).getStyleManager().setColorScheme(
+            colorScheme(self.private().window_theme_override, config),
+        );
+    }
+
+    fn colorScheme(
+        override: apprt.action.WindowTheme,
+        config: *const CoreConfig,
+    ) adw.ColorScheme {
+        return switch (override) {
+            .config => switch (config.@"window-theme") {
+                .auto, .ghostty => auto: {
+                    // A conditional theme's background follows the scheme,
+                    // so deriving the scheme from it can recurse forever
+                    // through the soft reload a scheme change triggers.
+                    if (config._conditional_set.contains(.theme)) {
+                        break :auto .prefer_light;
+                    }
+
+                    const lum = config.background.toTerminalRGB().perceivedLuminance();
+                    break :auto if (lum > 0.5)
+                        .prefer_light
+                    else
+                        .prefer_dark;
+                },
+                .system => .prefer_light,
+                .dark => .force_dark,
+                .light => .force_light,
+            },
+            .system => .prefer_light,
+            .light => .force_light,
+            .dark => .force_dark,
+        };
+    }
+
     /// Setup signal handlers
     fn startupSignals(self: *Self) void {
         const priv = self.private();
         assert(priv.signal_source == null);
         priv.signal_source = glibunix.signalAdd(
-            @intFromEnum(std.posix.SIG.USR2),
+            @backingInt(std.posix.SIG.USR2),
             handleSigusr2,
             self,
         );
@@ -1775,10 +1773,11 @@ pub const Application = extern struct {
         };
 
         var body_buf: [512]u8 = undefined;
-        const body = std.fmt.bufPrintZ(
+        const body = std.mem.printSentinel(
             &body_buf,
             "{s}: {s}",
             .{ label, detail },
+            0,
         ) catch return;
 
         Action.desktopNotification(self, .app, .{
@@ -1852,7 +1851,7 @@ pub const Application = extern struct {
             var arguments_it: glib.VariantIter = undefined;
             _ = arguments_it.init(arguments);
 
-            break :overrides parseOverrides(alloc, &arguments_it) catch null;
+            break :overrides Overrides.parse(alloc, &arguments_it) catch null;
         };
 
         Action.newWindow(
@@ -1913,7 +1912,7 @@ pub const Application = extern struct {
 
             const arguments_it = arguments_it_ orelse return;
 
-            const overrides = parseOverrides(alloc, arguments_it) catch return;
+            const overrides = Overrides.parse(alloc, arguments_it) catch return;
 
             break :result .{ if (surface_id == 0) null else surface_id, overrides };
         };
@@ -1962,108 +1961,6 @@ pub const Application = extern struct {
                 log.warn("new-tab: unable to create new window: {t}", .{err});
             };
         }
-    }
-
-    fn parseOverrides(arena_alloc: Allocator, arguments_it: *glib.VariantIter) (Allocator.Error || error{ValueRequired})!struct {
-        command: ?configpkg.Command = null,
-        shell_integration: ?configpkg.Config.ShellIntegration = null,
-        working_directory: ?[:0]const u8 = null,
-        title: ?[:0]const u8 = null,
-    } {
-        var args: std.ArrayList([:0]const u8) = .empty;
-
-        var working_directory: ?[:0]const u8 = null;
-        var title: ?[:0]const u8 = null;
-        var command: ?configpkg.Command = null;
-        var parsed_shell_integration: struct {
-            @"shell-integration": ?configpkg.Config.ShellIntegration = null,
-        } = .{};
-
-        const s_variant_type = glib.VariantType.new("s");
-        defer s_variant_type.free();
-
-        var e_seen: bool = false;
-        var i: usize = 0;
-
-        while (arguments_it.nextValue()) |value| : (i += 1) {
-            defer value.unref();
-
-            // just to be sure
-            if (value.isOfType(s_variant_type) == 0) continue;
-
-            var len: usize = undefined;
-            const buf = value.getString(&len);
-            const str = buf[0..len];
-
-            log.debug("argument: {d} {s}", .{ i, str });
-
-            if (e_seen) {
-                const copy = arena_alloc.dupeZ(u8, str) catch |err| {
-                    log.warn("unable to duplicate argument {d} {s}: {t}", .{ i, str, err });
-                    return err;
-                };
-                args.append(arena_alloc, copy) catch |err| {
-                    log.warn("unable to append argument {d} {s}: {t}", .{ i, str, err });
-                    return err;
-                };
-                continue;
-            }
-
-            if (std.mem.eql(u8, str, "-e")) {
-                e_seen = true;
-                continue;
-            }
-
-            if (std.mem.cutPrefix(u8, str, "--command=")) |v| {
-                var cmd: configpkg.Command = undefined;
-                cmd.parseCLI(arena_alloc, v) catch |err| {
-                    log.warn("unable to parse command: {t}", .{err});
-                    return err;
-                };
-                command = cmd;
-                continue;
-            }
-            if (std.mem.cutPrefix(u8, str, "--shell-integration=")) |v| {
-                cli.args.parseIntoField(
-                    @TypeOf(parsed_shell_integration),
-                    arena_alloc,
-                    &parsed_shell_integration,
-                    "shell-integration",
-                    std.mem.trim(u8, v, &std.ascii.whitespace),
-                ) catch |err| {
-                    log.warn("unable to parse shell integration {s}: {t}", .{ v, err });
-                    continue;
-                };
-                continue;
-            }
-            if (std.mem.cutPrefix(u8, str, "--working-directory=")) |v| {
-                working_directory = arena_alloc.dupeZ(u8, std.mem.trim(u8, v, &std.ascii.whitespace)) catch |err| {
-                    log.warn("unable to duplicate working directory: {t}", .{err});
-                    return err;
-                };
-                continue;
-            }
-            if (std.mem.cutPrefix(u8, str, "--title=")) |v| {
-                title = arena_alloc.dupeZ(u8, std.mem.trim(u8, v, &std.ascii.whitespace)) catch |err| {
-                    log.warn("unable to duplicate title: {t}", .{err});
-                    return err;
-                };
-                continue;
-            }
-        }
-
-        if (args.items.len > 0) {
-            command = .{
-                .direct = args.items,
-            };
-        }
-
-        return .{
-            .command = command,
-            .shell_integration = parsed_shell_integration.@"shell-integration",
-            .working_directory = working_directory,
-            .title = title,
-        };
     }
 
     pub fn actionOpenConfig(
@@ -2319,7 +2216,7 @@ const Action = struct {
         ) callconv(.c) void {
             defer dialog.unref();
 
-            if (response_id != @intFromEnum(gtk.ResponseType.accept)) return;
+            if (response_id != @backingInt(gtk.ResponseType.accept)) return;
 
             const file = dialog.as(gtk.FileChooser).getFile() orelse {
                 log.warn("inspector export dialog returned no file", .{});
@@ -2364,7 +2261,10 @@ const Action = struct {
 
         switch (target) {
             .surface => |core| core.rt_surface.surface.setConfig(config_obj),
-            .app => self.setConfig(config_obj),
+            .app => {
+                self.setConfig(config_obj);
+                self.syncStyleManager(new_config);
+            },
         }
     }
 
@@ -2471,7 +2371,7 @@ const Action = struct {
                     .previous => .previous,
                     .next => .next,
                     .last => .last,
-                    else => .{ .n = @intCast(@intFromEnum(tab)) },
+                    else => .{ .n = @intCast(@backingInt(tab)) },
                 });
             },
         }
@@ -2658,17 +2558,7 @@ const Action = struct {
         }
     }
 
-    pub fn newTab(
-        target: apprt.Target,
-        overrides: struct {
-            command: ?configpkg.Command = null,
-            shell_integration: ?configpkg.Config.ShellIntegration = null,
-            working_directory: ?[:0]const u8 = null,
-            title: ?[:0]const u8 = null,
-
-            pub const none: @This() = .{};
-        },
-    ) bool {
+    pub fn newTab(target: apprt.Target, overrides: Overrides) bool {
         switch (target) {
             .app => {
                 log.warn("new tab to app is unexpected", .{});
@@ -2698,18 +2588,7 @@ const Action = struct {
         }
     }
 
-    pub fn newWindow(
-        self: *Application,
-        parent: ?*CoreSurface,
-        overrides: struct {
-            command: ?configpkg.Command = null,
-            shell_integration: ?configpkg.Config.ShellIntegration = null,
-            working_directory: ?[:0]const u8 = null,
-            title: ?[:0]const u8 = null,
-
-            pub const none: @This() = .{};
-        },
-    ) !void {
+    pub fn newWindow(self: *Application, parent: ?*CoreSurface, overrides: Overrides) !void {
         // Note that we've requested a window at least once. This is used
         // to trigger quit on no windows. Note I'm not sure if this is REALLY
         // necessary, but I don't want to risk a bug where on a slow machine
@@ -2737,14 +2616,7 @@ const Action = struct {
         self: *Application,
         win: *Window,
         parent: ?*CoreSurface,
-        overrides: struct {
-            command: ?configpkg.Command = null,
-            shell_integration: ?configpkg.Config.ShellIntegration = null,
-            working_directory: ?[:0]const u8 = null,
-            title: ?[:0]const u8 = null,
-
-            pub const none: @This() = .{};
-        },
+        overrides: Overrides,
     ) void {
         // Setup a binding so that whenever our config changes so does the
         // window. There's never a time when the window config should be out
@@ -2809,8 +2681,7 @@ const Action = struct {
                     .direct = &.{ "/bin/sh", "-c", cmd },
                 };
 
-                const title = std.fmt.allocPrintSentinel(
-                    alloc,
+                const title = alloc.printSentinel(
                     "{s} {s}",
                     .{ i18n._("Editing configuration file"), path },
                     0,
@@ -2823,6 +2694,8 @@ const Action = struct {
                 Action.newWindow(self, null, .{
                     .command = command,
                     .title = title,
+                    .shell_integration = null,
+                    .working_directory = null,
                 }) catch |err| {
                     log.warn("unable to create new window: {t}", .{err});
                     return false;
@@ -2944,6 +2817,24 @@ const Action = struct {
         }
     }
 
+    pub fn setWindowTheme(
+        self: *Application,
+        theme: apprt.action.WindowTheme,
+    ) void {
+        const priv = self.private();
+        priv.window_theme_override = theme;
+        self.syncStyleManager(priv.config.get());
+
+        // The style manager only notifies on an effective scheme change, so
+        // the runtime CSS must be reloaded directly.
+        self.loadRuntimeCss() catch |err| switch (err) {
+            error.WriteFailed, error.OutOfMemory => log.warn(
+                "out of memory loading runtime CSS, no runtime CSS applied",
+                .{},
+            ),
+        };
+    }
+
     /// Reload the configuration for the application and propagate it
     /// across the entire application and all terminals.
     pub fn reloadConfig(
@@ -2951,11 +2842,13 @@ const Action = struct {
         target: apprt.Target,
         opts: apprt.action.ReloadConfig,
     ) !void {
-        // Tell systemd that reloading has started.
-        systemd.notify.reloading();
+        // Tell systemd that reloading has started, but only once startup
+        // is complete. A reload during startup is not a reload to systemd.
+        const notify_systemd = self.private().systemd_ready;
+        if (notify_systemd) systemd.notify.reloading();
 
         // When we exit this function tell systemd that reloading has finished.
-        defer systemd.notify.ready();
+        defer if (notify_systemd) systemd.notify.ready();
 
         // Get our config object.
         const config: *Config = config: {
@@ -3029,6 +2922,30 @@ const Action = struct {
                         return false;
                     },
                 };
+            },
+        }
+    }
+
+    pub fn resizeWindow(
+        target: apprt.Target,
+        value: apprt.action.ResizeWindow,
+    ) bool {
+        switch (target) {
+            .app => {
+                log.warn("resize_window to app is unexpected", .{});
+                return false;
+            },
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                const window = ext.getAncestor(
+                    Window,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a window, ignoring resize_window", .{});
+                    return false;
+                };
+
+                return window.resizeSurface(surface, value);
             },
         }
     }
@@ -3165,6 +3082,19 @@ const Action = struct {
                     .height = value.min_height,
                 });
 
+                return true;
+            },
+        }
+    }
+
+    pub fn cellSize(
+        target: apprt.Target,
+        value: apprt.action.CellSize,
+    ) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                core.rt_surface.surface.setCellSize(value.width, value.height);
                 return true;
             },
         }
@@ -3380,78 +3310,31 @@ const Action = struct {
 fn setGtkEnv(config: *const CoreConfig) std.Io.Writer.Error!void {
     assert(gtk.isInitialized() == 0);
 
-    var gdk_debug: struct {
-        /// output OpenGL debug information
+    const gdk_debug: struct {
+        /// Output OpenGL debug information,
+        /// `gtk-opengl-debug` dumps logs directly to stderr so both must be true
+        /// to enable OpenGL debugging.
         opengl: bool = false,
-        /// disable GLES, Ghostty can't use GLES
-        @"gl-disable-gles": bool = false,
-        // GTK's new renderer can cause blurry font when using fractional scaling.
-        @"gl-no-fractional": bool = false,
-        /// Disabling Vulkan can improve startup times by hundreds of
-        /// milliseconds on some systems. We don't use Vulkan so we can just
-        /// disable it.
-        @"vulkan-disable": bool = false,
     } = .{
-        // `gtk-opengl-debug` dumps logs directly to stderr so both must be true
-        // to enable OpenGL debugging.
         .opengl = global.logging().stderr and config.@"gtk-opengl-debug",
     };
 
-    var gdk_disable: struct {
-        @"gles-api": bool = false,
-        /// current gtk implementation for color management is not good enough.
-        /// see: https://bugs.kde.org/show_bug.cgi?id=495647
-        /// gtk issue: https://gitlab.gnome.org/GNOME/gtk/-/issues/6864
-        @"color-mgmt": bool = true,
-        /// Disabling Vulkan can improve startup times by hundreds of
-        /// milliseconds on some systems. We don't use Vulkan so we can just
-        /// disable it.
-        vulkan: bool = false,
+    const gdk_disable: struct {
+        // Even though we don't use GTK's GL context anymore, there can still
+        // occasionally be conflicts when Vulkan and OpenGL are used together.
+        // Disabling Vulkan also saves hundreds of milliseconds of initialization
+        // time on certain systems.
+        vulkan: bool = true,
     } = .{};
-
-    environment: {
-        if (gtk_version.runtimeAtLeast(4, 18, 0)) {
-            gdk_disable.@"color-mgmt" = false;
-        }
-
-        if (gtk_version.runtimeAtLeast(4, 16, 0)) {
-            // From gtk 4.16, GDK_DEBUG is split into GDK_DEBUG and GDK_DISABLE.
-            // For the remainder of "why" see the 4.14 comment below.
-            gdk_disable.@"gles-api" = true;
-            gdk_disable.vulkan = true;
-            break :environment;
-        }
-        if (gtk_version.runtimeAtLeast(4, 14, 0)) {
-            // We need to export GDK_DEBUG to run on Wayland after GTK 4.14.
-            // Older versions of GTK do not support these values so it is safe
-            // to always set this. Forwards versions are uncertain so we'll have
-            // to reassess...
-            //
-            // Upstream issue: https://gitlab.gnome.org/GNOME/gtk/-/issues/6589
-            gdk_debug.@"gl-disable-gles" = true;
-            gdk_debug.@"vulkan-disable" = true;
-
-            if (gtk_version.runtimeUntil(4, 17, 5)) {
-                // Removed at GTK v4.17.5
-                gdk_debug.@"gl-no-fractional" = true;
-            }
-            break :environment;
-        }
-
-        // Versions prior to 4.14 are a bit of an unknown for Ghostty. It
-        // is an environment that isn't tested well and we don't have a
-        // good understanding of what we may need to do.
-        gdk_debug.@"vulkan-disable" = true;
-    }
 
     {
         var buf: [1024]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
         var first: bool = true;
-        inline for (@typeInfo(@TypeOf(gdk_debug)).@"struct".fields) |field| {
-            if (@field(gdk_debug, field.name)) {
+        inline for (@typeInfo(@TypeOf(gdk_debug)).@"struct".field_names) |field| {
+            if (@field(gdk_debug, field)) {
                 if (!first) try writer.writeAll(",");
-                try writer.writeAll(field.name);
+                try writer.writeAll(field);
                 first = false;
             }
         }
@@ -3465,10 +3348,10 @@ fn setGtkEnv(config: *const CoreConfig) std.Io.Writer.Error!void {
         var buf: [1024]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
         var first: bool = true;
-        inline for (@typeInfo(@TypeOf(gdk_disable)).@"struct".fields) |field| {
-            if (@field(gdk_disable, field.name)) {
+        inline for (@typeInfo(@TypeOf(gdk_disable)).@"struct".field_names) |field| {
+            if (@field(gdk_disable, field)) {
                 if (!first) try writer.writeAll(",");
-                try writer.writeAll(field.name);
+                try writer.writeAll(field);
                 first = false;
             }
         }
@@ -3489,4 +3372,36 @@ fn findActiveWindow(data: ?*const anyopaque, _: ?*const anyopaque) callconv(.c) 
     // but we want to return 0 to indicate equality.
     // Abusing integers to be enums and booleans is a terrible idea, C.
     return if (window.isActive() != 0) 0 else -1;
+}
+
+test "colorScheme" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var config: CoreConfig = try .default(alloc);
+    defer config.deinit();
+
+    const white: CoreConfig.Color = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
+    const black: CoreConfig.Color = .{ .r = 0x00, .g = 0x00, .b = 0x00 };
+
+    for ([_]CoreConfig.WindowTheme{ .auto, .ghostty }) |theme| {
+        config.@"window-theme" = theme;
+        config._conditional_set = .{};
+
+        config.background = white;
+        try testing.expectEqual(.prefer_light, Application.colorScheme(.config, &config));
+        config.background = black;
+        try testing.expectEqual(.prefer_dark, Application.colorScheme(.config, &config));
+
+        // The scheme must not depend on a background that depends on the scheme.
+        config._conditional_set.insert(.theme);
+        config.background = white;
+        try testing.expectEqual(.prefer_light, Application.colorScheme(.config, &config));
+        config.background = black;
+        try testing.expectEqual(.prefer_light, Application.colorScheme(.config, &config));
+    }
+
+    config.@"window-theme" = .light;
+    try testing.expectEqual(.force_light, Application.colorScheme(.config, &config));
+    try testing.expectEqual(.force_dark, Application.colorScheme(.dark, &config));
+    try testing.expectEqual(.prefer_light, Application.colorScheme(.system, &config));
 }

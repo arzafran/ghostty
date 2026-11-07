@@ -43,10 +43,11 @@ pub const Options = struct {
     version: std.SemanticVersion,
 
     /// Optional features for lib artifacts. Disabling a feature removes
-    /// its C API exports and any stream-integrated handling from the
+    /// its implementation and any stream-integrated handling from the
     /// build, primarily so size-conscious embedders (e.g. wasm) can trim
-    /// the binary. The Ghostty application itself always builds with
-    /// every feature enabled.
+    /// the binary. Its C API functions are still exported, but they
+    /// return `GHOSTTY_UNSUPPORTED`. The Ghostty application itself
+    /// always builds with every feature enabled.
     ///
     /// Field names are the accepted tokens for `-Dvt-features`, which
     /// acts like `-Dcpu`: comma-separated modifications applied on top
@@ -72,8 +73,7 @@ pub const Options = struct {
         /// such as cursor position, palette, modes, and tabstops. Used
         /// for copy-to-clipboard, dump-to-file, and debugging.
         ///
-        /// C API: `ghostty_formatter_*` and, together with `selection`,
-        /// `ghostty_terminal_selection_format_*`.
+        /// C API: `ghostty_formatter_*`.
         formatter: bool = true,
 
         /// Text selection: select word/line/output/all, selection
@@ -87,6 +87,15 @@ pub const Options = struct {
         /// C API: `ghostty_terminal_select_*`,
         /// `ghostty_terminal_selection_*`, `ghostty_selection_gesture_*`.
         selection: bool = true,
+
+        /// Terminal search: find matches for a string in the active
+        /// area and scrollback (ASCII case-insensitive), with results
+        /// that survive primary/alternate screen switches, resize, and
+        /// scrollback pruning, plus match selection with wrap-around
+        /// and viewport scrolling. Used to implement find bars.
+        ///
+        /// C API: `ghostty_search_*`.
+        search: bool = true,
 
         /// The render state API: a coherent, update-in-place view of
         /// the visible screen (rows, cells, styles, cursor, colors,
@@ -179,16 +188,16 @@ pub const Options = struct {
 
                 // The special name "all" refers to every feature.
                 if (std.mem.eql(u8, name, "all")) {
-                    inline for (@typeInfo(Features).@"struct".fields) |field| {
-                        @field(result, field.name) = enable;
+                    inline for (@typeInfo(Features).@"struct".field_names) |field| {
+                        @field(result, field) = enable;
                     }
                     continue;
                 }
 
                 var found = false;
-                inline for (@typeInfo(Features).@"struct".fields) |field| {
-                    if (eqlName(name, field.name)) {
-                        @field(result, field.name) = enable;
+                inline for (@typeInfo(Features).@"struct".field_names) |field| {
+                    if (eqlName(name, field)) {
+                        @field(result, field) = enable;
                         found = true;
                     }
                 }
@@ -263,8 +272,7 @@ pub const Options = struct {
     /// targets, so it is always disabled there regardless of the
     /// feature setting.
     pub fn kittyGraphics(self: Options, target: std.Target) bool {
-        if (target.cpu.arch == .wasm32 and target.os.tag == .freestanding)
-            return false;
+        if (target.os.tag == .freestanding) return false;
         return self.features.kitty_graphics;
     }
 
@@ -289,16 +297,16 @@ pub const Options = struct {
 
         // Feature gates, emitted as flat bools (e.g. `options.snapshot`).
         const target = m.resolved_target.?.result;
-        inline for (@typeInfo(Features).@"struct".fields) |field| {
-            var value = @field(self.features, field.name);
+        inline for (@typeInfo(Features).@"struct".field_names) |field| {
+            var value = @field(self.features, field);
 
             // Kitty graphics is force-disabled on some targets; see
             // kittyGraphics for details.
-            if (comptime std.mem.eql(u8, field.name, "kitty_graphics")) {
+            if (comptime std.mem.eql(u8, field, "kitty_graphics")) {
                 value = self.kittyGraphics(target);
             }
 
-            opts.addOption(bool, field.name, value);
+            opts.addOption(bool, field, value);
         }
 
         // Version information.

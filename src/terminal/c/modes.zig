@@ -10,7 +10,7 @@ pub const ReportState = enum(c_int) {
     fn toZig(self: ReportState) ?modes.Report.State {
         return std.enums.fromInt(
             modes.Report.State,
-            @intFromEnum(self),
+            @backingInt(self),
         );
     }
 };
@@ -20,11 +20,12 @@ pub fn report_encode(
     state: ReportState,
     out_: ?[*]u8,
     out_len: usize,
-    out_written: *usize,
+    out_written_: ?*usize,
 ) callconv(lib.calling_conv) Result {
+    const out_written = out_written_ orelse return .invalid_value;
     const mode_tag: modes.ModeTag = @bitCast(tag);
     const report: modes.Report = .{
-        .tag = mode_tag,
+        .tag = .{ .value = mode_tag.value, .ansi = mode_tag.ansi },
         .state = state.toZig() orelse return .invalid_value,
     };
 
@@ -46,7 +47,7 @@ test "encode DEC mode set" {
     var buf: [modes.Report.max_size]u8 = undefined;
     var written: usize = 0;
     const tag: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 1, .ansi = false });
-    const result = report_encode(tag, @enumFromInt(1), &buf, buf.len, &written);
+    const result = report_encode(tag, @fromBackingInt(1), &buf, buf.len, &written);
     try std.testing.expectEqual(.success, result);
     try std.testing.expectEqualStrings("\x1B[?1;1$y", buf[0..written]);
 }
@@ -55,7 +56,7 @@ test "encode DEC mode reset" {
     var buf: [modes.Report.max_size]u8 = undefined;
     var written: usize = 0;
     const tag: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 1, .ansi = false });
-    const result = report_encode(tag, @enumFromInt(2), &buf, buf.len, &written);
+    const result = report_encode(tag, @fromBackingInt(2), &buf, buf.len, &written);
     try std.testing.expectEqual(.success, result);
     try std.testing.expectEqualStrings("\x1B[?1;2$y", buf[0..written]);
 }
@@ -64,7 +65,7 @@ test "encode ANSI mode" {
     var buf: [modes.Report.max_size]u8 = undefined;
     var written: usize = 0;
     const tag: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 4, .ansi = true });
-    const result = report_encode(tag, @enumFromInt(1), &buf, buf.len, &written);
+    const result = report_encode(tag, @fromBackingInt(1), &buf, buf.len, &written);
     try std.testing.expectEqual(.success, result);
     try std.testing.expectEqualStrings("\x1B[4;1$y", buf[0..written]);
 }
@@ -73,7 +74,7 @@ test "encode not recognized" {
     var buf: [modes.Report.max_size]u8 = undefined;
     var written: usize = 0;
     const tag: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 9999, .ansi = false });
-    const result = report_encode(tag, @enumFromInt(0), &buf, buf.len, &written);
+    const result = report_encode(tag, @fromBackingInt(0), &buf, buf.len, &written);
     try std.testing.expectEqual(.success, result);
     try std.testing.expectEqualStrings("\x1B[?9999;0$y", buf[0..written]);
 }
@@ -82,7 +83,7 @@ test "encode with insufficient buffer" {
     var buf: [1]u8 = undefined;
     var written: usize = 0;
     const tag: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 1, .ansi = false });
-    const result = report_encode(tag, @enumFromInt(1), &buf, buf.len, &written);
+    const result = report_encode(tag, @fromBackingInt(1), &buf, buf.len, &written);
     try std.testing.expectEqual(.out_of_space, result);
     try std.testing.expect(written > 1);
 }
@@ -91,14 +92,14 @@ test "encode with invalid state" {
     var buf: [modes.Report.max_size]u8 = undefined;
     var written: usize = 0;
     const tag: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 1, .ansi = false });
-    const result = report_encode(tag, @enumFromInt(99), &buf, buf.len, &written);
+    const result = report_encode(tag, @fromBackingInt(99), &buf, buf.len, &written);
     try std.testing.expectEqual(.invalid_value, result);
 }
 
 test "encode with null buffer" {
     var written: usize = 0;
     const tag: modes.ModeTag.Backing = @bitCast(modes.ModeTag{ .value = 1, .ansi = false });
-    const result = report_encode(tag, @enumFromInt(1), null, 0, &written);
+    const result = report_encode(tag, @fromBackingInt(1), null, 0, &written);
     try std.testing.expectEqual(.out_of_space, result);
     try std.testing.expect(written > 0);
 }

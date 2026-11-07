@@ -40,6 +40,10 @@ class ClipboardConfirmationController: NSWindowController {
     override func windowDidLoad() {
         guard let window = window else { return }
 
+        // AppKit otherwise ignores quit requests, including those from logout
+        // and shutdown, for as long as this window is presented as a sheet.
+        window.preventsApplicationTerminationWhenModal = false
+
         configure(window)
     }
 
@@ -47,13 +51,15 @@ class ClipboardConfirmationController: NSWindowController {
         switch confirmation.kind {
         case .paste:
             window.title = "Warning: Potentially Unsafe Paste"
-        case .osc_52_read, .osc_52_write:
+        case .osc_52_read, .osc_52_write, .kitty_read, .kitty_write:
             window.title = "Authorize Clipboard Access"
         }
 
         window.contentView = NSHostingView(rootView: ClipboardConfirmationView(
             contents: confirmation.contents,
             request: confirmation.kind,
+            canRemember: confirmation.canRemember,
+            previewImage: confirmation.previewImage,
             delegate: delegate
         ))
     }

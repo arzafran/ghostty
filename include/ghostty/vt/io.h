@@ -10,12 +10,29 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <ghostty/vt/types.h>
 
-/** @defgroup io I/O
+/** @addtogroup io
  *
- * Synchronous callback interfaces used by APIs that consume or produce byte
- * streams. The callback and userdata pointers must remain valid for the full
- * lifetime documented by the API receiving a GhosttyReader or GhosttyWriter.
+ * A GhosttyReader or GhosttyWriter is a callback and a userdata pointer that
+ * move bytes in or out of the library.
+ *
+ * You need one to stream a format or a snapshot without holding all of it in
+ * memory. The callbacks run synchronously. The callback and userdata pointers
+ * must remain valid for the full lifetime documented by the API receiving a
+ * GhosttyReader or GhosttyWriter.
+ *
+ * ## Example
+ *
+ * @code{.c}
+ * GhosttyWriter writer = {.write = write_output, .userdata = &output};
+ * ghostty_formatter_format(formatter, writer);
+ * @endcode
+ *
+ * Full program: @ref c-vt-formatter/src/main.c
+ *
+ * See the @ref guide-snapshots "Snapshots guide" for reading and writing a
+ * snapshot.
  *
  * @{
  */
@@ -97,6 +114,49 @@ typedef struct {
     GhosttyWriterFn write;
     void* userdata;
 } GhosttyWriter;
+
+/**
+ * Read one MIME-typed representation of some content, streaming its
+ * bytes to a writer.
+ *
+ * The library calls this with the MIME type of the representation it
+ * needs. The callback writes all of that representation's data to
+ * @p writer, in as many calls to `writer.write(writer.userdata, data,
+ * len)` as is convenient (one call with everything or many small
+ * pieces both work), and returns true. Nothing written is retained
+ * beyond each write call, so the data may be borrowed from anywhere:
+ * a pasteboard item, a file being read, a stream.
+ *
+ * Returning false reports that the data could not be read. If the
+ * writer refuses a write (returns false), stop and return false
+ * without writing more.
+ *
+ * All pointer arguments, the mime, and the writer are borrowed and
+ * valid only for the duration of the callback. The callback is
+ * invoked synchronously on the calling thread. The API receiving the
+ * GhosttyMimeReader defines which MIME types are requested, how many
+ * times, and any consistency requirements across repeated reads.
+ *
+ * @param userdata Opaque userdata from GhosttyMimeReader
+ * @param mime The MIME type of the representation to read
+ * @param writer Where to write the data; valid only during this call
+ * @return true once all the data was written, false if it could not
+ *         be read or the writer refused a write
+ */
+typedef bool (*GhosttyMimeReaderFn)(
+    void* userdata,
+    GhosttyString mime,
+    GhosttyWriter writer);
+
+/**
+ * A MIME-typed content source callback and its opaque context.
+ *
+ * The struct is passed by value. @p read must be non-NULL.
+ */
+typedef struct {
+    GhosttyMimeReaderFn read;
+    void* userdata;
+} GhosttyMimeReader;
 
 #ifdef __cplusplus
 }

@@ -26,14 +26,10 @@ pub const Face = switch (options.backend) {
 /// If a DPI can't be calculated, this DPI is used. This is probably
 /// wrong on modern devices so it is highly recommended you get the DPI
 /// using whatever platform method you can.
-///
-/// cmux fork: iOS uses the same 72-points-per-inch logical coordinate
-/// system as macOS (UIKit points == AppKit points); the Retina pixel
-/// multiplier is applied separately through `content_scale`. Treating
-/// iOS like the FreeType/Linux 96 DPI default inflated every glyph and
-/// padding value by 96/72 ≈ 1.33x, which read as "way too zoomed in"
-/// on device. Group iOS with macOS so points map 1:1 to on-screen size.
-pub const default_dpi = switch (builtin.os.tag) {
+/// Fork: iOS uses the same 72-points-per-inch logical coordinate system as
+/// macOS (UIKit points == AppKit points); the Retina multiplier is applied
+/// separately through `content_scale`.
+pub const default_dpi = switch (builtin.target.os.tag) {
     .macos, .ios => 72,
     else => 96,
 };

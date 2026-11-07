@@ -3,11 +3,7 @@
     .version = "0.0.0",
     .fingerprint = 0x67c0c059de921c4f,
     .dependencies = .{
-        .translate_c = .{
-            .lazy = true,
-            .url = "https://deps.files.ghostty.org/translate_c-80f8b6e4f45a303268717d8e5f4f91d7837138bb.tar.gz",
-            .hash = "translate_c-0.0.0-Q_BUWmU6BwB_9JKG2l2W7i_mhmYWeRseTGBEHi_YlV5f",
-        },
+        .translate_c = .{ .path = "../translate-c" },
 
         // google/wuffs
         .wuffs = .{
@@ -28,5 +24,11 @@
         "build.zig.zon",
         "include",
         "src",
+    },
+    // The license and version of the third-party code above, for
+    // packagers. Zig ignores this field. See src/build/LibVtPackages.zig.
+    .third_party = .{
+        .{ .name = "pixels", .license = "CC0-1.0" },
+        .{ .name = "wuffs", .license = "Apache-2.0 OR MIT", .version = "0.4.0-alpha.10" },
     },
 }

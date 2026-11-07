@@ -1,8 +1,5 @@
 const std = @import("std");
-const testing = std.testing;
 const lib = @import("../lib.zig");
-const CAllocator = lib.alloc.Allocator;
-const formatterpkg = @import("../formatter.zig");
 const grid_ref = @import("grid_ref.zig");
 const point = @import("../point.zig");
 const selection_codepoints = @import("../selection_codepoints.zig");
@@ -14,14 +11,26 @@ const log = std.log.scoped(.selection_c);
 
 pub const Adjustment = Selection.Adjustment;
 pub const Order = Selection.Order;
-pub const Format = formatterpkg.Format;
 
 /// C: GhosttySelection
+///
+/// A range of terminal content between two cells. C callers allocate this
+/// struct themselves, so its size and field offsets are part of the ABI.
+/// The C header documents them, and the comptime block below keeps the
+/// two in sync.
 pub const CSelection = extern struct {
-    size: usize = @sizeOf(CSelection),
     start: grid_ref.CGridRef,
     end: grid_ref.CGridRef,
     rectangle: bool = false,
+
+    // Expected sizes: 40 bytes on 64-bit targets, 20 bytes on 32-bit.
+    comptime {
+        std.debug.assert(@sizeOf(CSelection) == switch (@sizeOf(usize)) {
+            8 => 40,
+            4 => 20,
+            else => unreachable,
+        });
+    }
 
     pub fn toZig(self: CSelection) ?Selection {
         const start_pin = self.start.toPin() orelse return null;
@@ -38,12 +47,26 @@ pub const CSelection = extern struct {
     }
 };
 
+/// C: GhosttySelectionBuffer
+///
+/// A caller-provided buffer of selections. This follows the same
+/// conventions as GhosttyBuffer: ptr may be NULL with cap 0 to query
+/// the required capacity, and len is set to the entries written on
+/// success or to the required capacity on GHOSTTY_OUT_OF_SPACE.
+pub const CSelectionBuffer = extern struct {
+    ptr: ?[*]CSelection = null,
+    cap: usize = 0,
+    len: usize = 0,
+};
+
 /// C: GhosttyTerminalSelectWordOptions
 pub const SelectWordOptions = extern struct {
     size: usize = @sizeOf(SelectWordOptions),
     ref: grid_ref.CGridRef,
     boundary_codepoints: ?[*]const u32 = null,
     boundary_codepoints_len: usize = 0,
+
+    pub const sized_base = "boundary_codepoints_len";
 };
 
 /// C: GhosttyTerminalSelectWordBetweenOptions
@@ -53,6 +76,8 @@ pub const SelectWordBetweenOptions = extern struct {
     end: grid_ref.CGridRef,
     boundary_codepoints: ?[*]const u32 = null,
     boundary_codepoints_len: usize = 0,
+
+    pub const sized_base = "boundary_codepoints_len";
 };
 
 /// C: GhosttyTerminalSelectLineOptions
@@ -62,15 +87,8 @@ pub const SelectLineOptions = extern struct {
     whitespace: ?[*]const u32 = null,
     whitespace_len: usize = 0,
     semantic_prompt_boundary: bool = false,
-};
 
-/// C: GhosttyTerminalSelectionFormatOptions
-pub const FormatOptions = extern struct {
-    size: usize = @sizeOf(FormatOptions),
-    emit: Format,
-    unwrap: bool,
-    trim: bool,
-    selection: ?*const CSelection = null,
+    pub const sized_base = "semantic_prompt_boundary";
 };
 
 pub fn word(
@@ -78,9 +96,10 @@ pub fn word(
     options: ?*const SelectWordOptions,
     out_selection: ?*CSelection,
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.selection)) return .unsupported;
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const opts = options orelse return .invalid_value;
-    if (opts.size < @sizeOf(SelectWordOptions)) return .invalid_value;
+    if (!lib.sizedCheck(.input, opts)) return .invalid_value;
     const out = out_selection orelse return .invalid_value;
 
     const boundary_codepoints = codepointSlice(
@@ -103,9 +122,10 @@ pub fn word_between(
     options: ?*const SelectWordBetweenOptions,
     out_selection: ?*CSelection,
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.selection)) return .unsupported;
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const opts = options orelse return .invalid_value;
-    if (opts.size < @sizeOf(SelectWordBetweenOptions)) return .invalid_value;
+    if (!lib.sizedCheck(.input, opts)) return .invalid_value;
     const out = out_selection orelse return .invalid_value;
 
     const boundary_codepoints = codepointSlice(
@@ -130,9 +150,10 @@ pub fn line(
     options: ?*const SelectLineOptions,
     out_selection: ?*CSelection,
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.selection)) return .unsupported;
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const opts = options orelse return .invalid_value;
-    if (opts.size < @sizeOf(SelectLineOptions)) return .invalid_value;
+    if (!lib.sizedCheck(.input, opts)) return .invalid_value;
     const out = out_selection orelse return .invalid_value;
 
     const whitespace = codepointSlice(
@@ -154,6 +175,7 @@ pub fn all(
     terminal: terminal_c.Terminal,
     out_selection: ?*CSelection,
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.selection)) return .unsupported;
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const out = out_selection orelse return .invalid_value;
 
@@ -163,111 +185,18 @@ pub fn all(
 
 pub fn output(
     terminal: terminal_c.Terminal,
-    ref: grid_ref.CGridRef,
+    ref_: ?*const grid_ref.CGridRef,
     out_selection: ?*CSelection,
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.selection)) return .unsupported;
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
+    const ref = ref_ orelse return .invalid_value;
     const out = out_selection orelse return .invalid_value;
 
     const screen = t.screens.active;
     const pin = ref.toPin() orelse return .invalid_value;
     out.* = .fromZig(screen.selectOutput(pin) orelse return .no_value);
     return .success;
-}
-
-pub fn format_buf(
-    terminal: terminal_c.Terminal,
-    opts: FormatOptions,
-    out_: ?[*]u8,
-    out_len: usize,
-    out_written: *usize,
-) callconv(lib.calling_conv) Result {
-    const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
-
-    if (out_ == null) {
-        var discarding: std.Io.Writer.Discarding = .init(&.{});
-        formatSelection(t, opts, &discarding.writer) catch |err| return switch (err) {
-            error.InvalidValue => .invalid_value,
-            error.NoValue => .no_value,
-            error.WriteFailed => unreachable,
-        };
-        out_written.* = @intCast(discarding.count);
-        return .out_of_space;
-    }
-
-    var writer: std.Io.Writer = .fixed(out_.?[0..out_len]);
-    formatSelection(t, opts, &writer) catch |err| switch (err) {
-        error.InvalidValue => return .invalid_value,
-        error.NoValue => return .no_value,
-        error.WriteFailed => {
-            var discarding: std.Io.Writer.Discarding = .init(&.{});
-            formatSelection(t, opts, &discarding.writer) catch unreachable;
-            out_written.* = @intCast(discarding.count);
-            return .out_of_space;
-        },
-    };
-
-    out_written.* = writer.end;
-    return .success;
-}
-
-pub fn format_alloc(
-    terminal: terminal_c.Terminal,
-    alloc_: ?*const CAllocator,
-    opts: FormatOptions,
-    out_ptr: *?[*]u8,
-    out_len: *usize,
-) callconv(lib.calling_conv) Result {
-    out_ptr.* = null;
-    out_len.* = 0;
-
-    const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
-    const alloc = lib.alloc.default(alloc_);
-
-    var aw: std.Io.Writer.Allocating = .init(alloc);
-    defer aw.deinit();
-
-    formatSelection(t, opts, &aw.writer) catch |err| return switch (err) {
-        error.InvalidValue => .invalid_value,
-        error.NoValue => .no_value,
-        error.WriteFailed => .out_of_memory,
-    };
-
-    const buf = aw.toOwnedSlice() catch return .out_of_memory;
-    out_ptr.* = buf.ptr;
-    out_len.* = buf.len;
-    return .success;
-}
-
-fn formatSelection(
-    t: *terminal_c.ZigTerminal,
-    opts: FormatOptions,
-    writer: *std.Io.Writer,
-) error{ InvalidValue, NoValue, WriteFailed }!void {
-    var formatter = selectionFormatter(t, opts) catch |err| return err;
-    try formatter.format(writer);
-}
-
-fn selectionFormatter(
-    t: *terminal_c.ZigTerminal,
-    opts: FormatOptions,
-) error{ InvalidValue, NoValue }!formatterpkg.TerminalFormatter {
-    if (opts.size < @sizeOf(FormatOptions)) return error.InvalidValue;
-    _ = std.enums.fromInt(Format, @intFromEnum(opts.emit)) orelse
-        return error.InvalidValue;
-
-    const sel = if (opts.selection) |sel|
-        sel.toZig() orelse return error.InvalidValue
-    else
-        t.screens.active.selection orelse return error.NoValue;
-
-    var formatter: formatterpkg.TerminalFormatter = .init(t, .{
-        .emit = opts.emit,
-        .unwrap = opts.unwrap,
-        .trim = opts.trim,
-    });
-    formatter.content = .{ .selection = sel };
-    return formatter;
 }
 
 /// Return the borrowed C array of `uint32_t` codepoints as a `[]const u21`.
@@ -305,14 +234,11 @@ fn codepointSlice(
 pub fn adjust(
     terminal: terminal_c.Terminal,
     selection: ?*CSelection,
-    adjustment: Selection.Adjustment,
+    adjustment_: lib.CEnum(Selection.Adjustment),
 ) callconv(lib.calling_conv) Result {
-    if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(Selection.Adjustment, @intFromEnum(adjustment)) orelse {
-            log.warn("terminal_selection_adjust invalid adjustment value={d}", .{@intFromEnum(adjustment)});
-            return .invalid_value;
-        };
-    }
+    if (comptime !lib.feature(.selection)) return .unsupported;
+    const adjustment = lib.enumFromC(Selection.Adjustment, adjustment_) orelse
+        return .invalid_value;
 
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const sel_ptr = selection orelse return .invalid_value;
@@ -327,6 +253,7 @@ pub fn order(
     selection: ?*const CSelection,
     out_order: ?*Selection.Order,
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.selection)) return .unsupported;
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const sel = (selection orelse return .invalid_value).toZig() orelse
         return .invalid_value;
@@ -339,15 +266,12 @@ pub fn order(
 pub fn ordered(
     terminal: terminal_c.Terminal,
     selection: ?*const CSelection,
-    desired: Selection.Order,
+    desired_: lib.CEnum(Selection.Order),
     out_selection: ?*CSelection,
 ) callconv(lib.calling_conv) Result {
-    if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(Selection.Order, @intFromEnum(desired)) orelse {
-            log.warn("terminal_selection_ordered invalid desired value={d}", .{@intFromEnum(desired)});
-            return .invalid_value;
-        };
-    }
+    if (comptime !lib.feature(.selection)) return .unsupported;
+    const desired = lib.enumFromC(Selection.Order, desired_) orelse
+        return .invalid_value;
 
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const sel = (selection orelse return .invalid_value).toZig() orelse
@@ -364,13 +288,15 @@ pub fn contains(
     pt: point.Point.C,
     out_contains: ?*bool,
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.selection)) return .unsupported;
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const sel = (selection orelse return .invalid_value).toZig() orelse
         return .invalid_value;
     const out = out_contains orelse return .invalid_value;
 
     const screen = t.screens.active;
-    const pin = screen.pages.pin(.fromC(pt)) orelse return .invalid_value;
+    const pin = screen.pages.pin(point.Point.fromC(pt) orelse return .invalid_value) orelse
+        return .invalid_value;
     out.* = sel.contains(screen, pin);
     return .success;
 }
@@ -381,6 +307,7 @@ pub fn equal(
     b: ?*const CSelection,
     out_equal: ?*bool,
 ) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.selection)) return .unsupported;
     _ = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const sel_a = (a orelse return .invalid_value).toZig() orelse
         return .invalid_value;
@@ -390,145 +317,4 @@ pub fn equal(
 
     out.* = sel_a.eql(sel_b);
     return .success;
-}
-
-test "selection_format_alloc uses active selection" {
-    var t: terminal_c.Terminal = null;
-    try testing.expectEqual(Result.success, terminal_c.new(
-        &lib.alloc.test_allocator,
-        &t,
-        80,
-        24,
-    ));
-    defer terminal_c.free(t);
-
-    terminal_c.vt_write(t, "Hello World", 11);
-
-    var start_ref: grid_ref.CGridRef = .{};
-    try testing.expectEqual(Result.success, terminal_c.grid_ref(t, .{
-        .tag = .active,
-        .value = .{ .active = .{ .x = 6, .y = 0 } },
-    }, &start_ref));
-
-    var end_ref: grid_ref.CGridRef = .{};
-    try testing.expectEqual(Result.success, terminal_c.grid_ref(t, .{
-        .tag = .active,
-        .value = .{ .active = .{ .x = 10, .y = 0 } },
-    }, &end_ref));
-
-    const sel: CSelection = .{
-        .start = start_ref,
-        .end = end_ref,
-    };
-    try testing.expectEqual(Result.success, terminal_c.set(t, .selection, @ptrCast(&sel)));
-
-    const opts: FormatOptions = .{
-        .emit = .plain,
-        .unwrap = true,
-        .trim = true,
-    };
-
-    var required: usize = 0;
-    try testing.expectEqual(Result.out_of_space, format_buf(
-        t,
-        opts,
-        null,
-        0,
-        &required,
-    ));
-    try testing.expectEqual(@as(usize, 5), required);
-
-    var out_ptr: ?[*]u8 = null;
-    var out_len: usize = 0;
-    try testing.expectEqual(Result.success, format_alloc(
-        t,
-        &lib.alloc.test_allocator,
-        opts,
-        &out_ptr,
-        &out_len,
-    ));
-    const ptr = out_ptr orelse return error.TestExpectedEqual;
-    defer lib.alloc.default(&lib.alloc.test_allocator).free(ptr[0..out_len]);
-
-    try testing.expectEqualStrings("World", ptr[0..out_len]);
-}
-
-test "selection_format_buf uses provided selection" {
-    var t: terminal_c.Terminal = null;
-    try testing.expectEqual(Result.success, terminal_c.new(
-        &lib.alloc.test_allocator,
-        &t,
-        80,
-        24,
-    ));
-    defer terminal_c.free(t);
-
-    terminal_c.vt_write(t, "Hello World", 11);
-
-    var start_ref: grid_ref.CGridRef = .{};
-    try testing.expectEqual(Result.success, terminal_c.grid_ref(t, .{
-        .tag = .active,
-        .value = .{ .active = .{ .x = 0, .y = 0 } },
-    }, &start_ref));
-
-    var end_ref: grid_ref.CGridRef = .{};
-    try testing.expectEqual(Result.success, terminal_c.grid_ref(t, .{
-        .tag = .active,
-        .value = .{ .active = .{ .x = 4, .y = 0 } },
-    }, &end_ref));
-
-    const sel: CSelection = .{
-        .start = start_ref,
-        .end = end_ref,
-    };
-    const opts: FormatOptions = .{
-        .emit = .plain,
-        .unwrap = true,
-        .trim = true,
-        .selection = &sel,
-    };
-
-    var small: [2]u8 = undefined;
-    var written: usize = 0;
-    try testing.expectEqual(Result.out_of_space, format_buf(
-        t,
-        opts,
-        &small,
-        small.len,
-        &written,
-    ));
-    try testing.expectEqual(@as(usize, 5), written);
-
-    var buf: [32]u8 = undefined;
-    try testing.expectEqual(Result.success, format_buf(
-        t,
-        opts,
-        &buf,
-        buf.len,
-        &written,
-    ));
-    try testing.expectEqualStrings("Hello", buf[0..written]);
-}
-
-test "selection_format_alloc returns no_value without active selection" {
-    var t: terminal_c.Terminal = null;
-    try testing.expectEqual(Result.success, terminal_c.new(
-        &lib.alloc.test_allocator,
-        &t,
-        80,
-        24,
-    ));
-    defer terminal_c.free(t);
-
-    var out_ptr: ?[*]u8 = @ptrFromInt(1);
-    var out_len: usize = 123;
-    try testing.expectEqual(Result.no_value, format_alloc(
-        t,
-        &lib.alloc.test_allocator,
-        .{ .emit = .plain, .unwrap = true, .trim = true },
-        &out_ptr,
-        &out_len,
-    ));
-    try testing.expect(out_ptr == null);
-    try testing.expectEqual(@as(usize, 0), out_len);
 }

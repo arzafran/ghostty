@@ -8,8 +8,8 @@ short_hash: []const u8,
 /// True if there was a diff at build time.
 changes: bool,
 
-/// The tag -- if any -- that this commit is a part of.
-tag: ?[]const u8,
+/// Every tag on the latest commit, such as `tip`, `v1.4.1`, and `vt-0.1.0`.
+tags: []const []const u8,
 
 /// The branch that was checked out at the time of the build.
 branch: []const u8,
@@ -21,7 +21,7 @@ pub fn detect(b: *std.Build) !Version {
     var code: u8 = 0;
     const branch: []const u8 = b: {
         const tmp: []u8 = b.runAllowFail(
-            &[_][]const u8{ "git", "-C", b.build_root.path orelse ".", "rev-parse", "--abbrev-ref", "HEAD" },
+            &[_][]const u8{ "git", "-C", b.root.subPathOrDot(), "rev-parse", "--abbrev-ref", "HEAD" },
             &code,
             .ignore,
         ) catch |err| switch (err) {
@@ -30,19 +30,22 @@ pub fn detect(b: *std.Build) !Version {
             else => return err,
         };
 
+        // Trim first so the trailing newline isn't sanitized into a '-'.
+        const trimmed = tmp[0..std.mem.trim(u8, tmp, &std.ascii.whitespace).len];
+
         // Replace characters that are not valid in semantic version
         // pre-release identifiers (which only allow [0-9A-Za-z-]).
         // Slashes would also mess up dist tarball paths.
-        for (tmp) |*c| {
+        for (trimmed) |*c| {
             if (!std.ascii.isAlphanumeric(c.*) and c.* != '-') c.* = '-';
         }
 
-        break :b tmp;
+        break :b trimmed;
     };
 
     const short_hash = short_hash: {
         const output = b.runAllowFail(
-            &[_][]const u8{ "git", "-C", b.build_root.path orelse ".", "-c", "log.showSignature=false", "log", "--pretty=format:%h", "-n", "1" },
+            &[_][]const u8{ "git", "-C", b.root.subPathOrDot(), "-c", "log.showSignature=false", "log", "--pretty=format:%h", "-n", "1" },
             &code,
             .ignore,
         ) catch |err| switch (err) {
@@ -50,23 +53,29 @@ pub fn detect(b: *std.Build) !Version {
             else => return err,
         };
 
-        break :short_hash std.mem.trimEnd(u8, output, "\r\n ");
+        break :short_hash std.mem.trim(u8, output, &std.ascii.whitespace);
     };
 
-    const tag = b.runAllowFail(
-        &[_][]const u8{ "git", "-C", b.build_root.path orelse ".", "describe", "--exact-match", "--tags" },
-        &code,
-        .ignore,
-    ) catch |err| switch (err) {
-        error.FileNotFound => return error.GitNotFound,
-        error.ExitCodeFailure => "", // expected
-        else => return err,
+    const tags: []const []const u8 = tags: {
+        const output = b.runAllowFail(
+            &[_][]const u8{ "git", "-C", b.root.subPathOrDot(), "tag", "--points-at", "HEAD" },
+            &code,
+            .ignore,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return error.GitNotFound,
+            else => return err,
+        };
+
+        var list: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.tokenizeAny(u8, output, "\r\n ");
+        while (it.next()) |tag| try list.append(b.allocator, tag);
+        break :tags list.items;
     };
 
     _ = b.runAllowFail(&[_][]const u8{
         "git",
         "-C",
-        b.build_root.path orelse ".",
+        b.root.subPathOrDot(),
         "diff",
         "--quiet",
         "--exit-code",
@@ -80,7 +89,7 @@ pub fn detect(b: *std.Build) !Version {
     return .{
         .short_hash = short_hash,
         .changes = changes,
-        .tag = if (tag.len > 0) std.mem.trimEnd(u8, tag, "\r\n ") else null,
-        .branch = std.mem.trimEnd(u8, branch, "\r\n "),
+        .tags = tags,
+        .branch = branch,
     };
 }

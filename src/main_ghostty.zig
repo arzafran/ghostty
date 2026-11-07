@@ -58,7 +58,7 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
     defer global.deinit();
     const alloc = global.alloc();
 
-    if (comptime builtin.mode == .Debug) {
+    if (comptime builtin.mode == .debug) {
         std.log.warn("This is a debug build. Performance will be very poor.", .{});
         std.log.warn("You should only use a debug build for developing Ghostty.", .{});
         std.log.warn("Otherwise, please rebuild in a release mode.", .{});
@@ -75,9 +75,7 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
     }
 
     if (comptime build_config.app_runtime == .none) {
-        var stdout_buf: [1024]u8 = undefined;
-        var stdout_writer = std.Io.File.stdout().writer(global.io(), &stdout_buf);
-        const stdout = &stdout_writer.interface;
+        const stdout = std.io.getStdOut().writer();
         try stdout.print("Usage: ghostty +<action> [flags]\n\n", .{});
         try stdout.print(
             \\This is the Ghostty helper CLI that accompanies the graphical Ghostty app.
@@ -94,7 +92,6 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
         ,
             .{},
         );
-        try stdout.flush();
 
         std.process.exit(0);
     }
@@ -153,7 +150,7 @@ fn logFn(
 
     stderr: {
         // don't log debug messages to stderr unless we are a debug build
-        if (comptime builtin.mode != .Debug and level == .debug) break :stderr;
+        if (comptime builtin.mode != .debug and level == .debug) break :stderr;
 
         // skip if we are not logging to stderr
         if (!global.logging().stderr) break :stderr;
@@ -209,7 +206,7 @@ pub const std_options: std.Options = .{
     // calculate and we want to make sure they're optimized out in
     // builds.
     .log_level = switch (builtin.mode) {
-        .Debug => .debug,
+        .debug => .debug,
         else => .info,
     },
 
@@ -231,7 +228,7 @@ pub const std_options: std.Options = .{
     .allow_stack_tracing = if (builtin.target.os.tag.isDarwin() and builtin.target.os.tag != .macos)
         false
     else
-        builtin.strip_debug_info,
+        !builtin.strip_debug_info,
 };
 
 test {

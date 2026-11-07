@@ -44,6 +44,23 @@ pub const Writer = extern struct {
     }
 };
 
+/// C: GhosttyMimeReaderFn
+pub const MimeReaderFn = *const fn (
+    userdata: ?*anyopaque,
+    mime: lib.String,
+    writer: Writer,
+) callconv(lib.calling_conv) bool;
+
+/// C: GhosttyMimeReader
+pub const MimeReader = extern struct {
+    read: ?MimeReaderFn = null,
+    userdata: ?*anyopaque = null,
+
+    pub fn valid(self: MimeReader) bool {
+        return self.read != null;
+    }
+};
+
 /// Adapts a `GhosttyReader` to `std.Io.Reader`.
 ///
 /// The adapter must have a stable address while `interface` is in use. Its
@@ -418,6 +435,8 @@ test "C reader and writer layouts keep callback first" {
     try std.testing.expectEqual(@sizeOf(?ReaderFn) + @sizeOf(?*anyopaque), @sizeOf(Reader));
 
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(Writer, "write"));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(MimeReader, "read"));
+    try std.testing.expectEqual(@sizeOf(?MimeReaderFn), @offsetOf(MimeReader, "userdata"));
     try std.testing.expectEqual(@sizeOf(?WriterFn), @offsetOf(Writer, "userdata"));
     try std.testing.expectEqual(@sizeOf(?WriterFn) + @sizeOf(?*anyopaque), @sizeOf(Writer));
 }
@@ -610,9 +629,10 @@ test "WriterAdapter buffered batches small writes" {
     // Flush delivers everything in a single call.
     try adapter.interface.flush();
     try std.testing.expectEqual(@as(usize, 1), context.calls);
-    try std.testing.expectEqualStrings(
-        "ab" ** 16,
-        context.data[0..context.len],
+
+    for (0..16) |i| try std.testing.expectEqualStrings(
+        "ab",
+        context.data[i * 2 ..][0..2],
     );
     try std.testing.expectEqual(@as(usize, 32), adapter.offset);
 }
@@ -651,8 +671,9 @@ test "WriterAdapter buffered splats and large writes" {
     try adapter.interface.writeAll("xy");
     try adapter.interface.flush();
 
+    const blank: [40]u8 = @splat(' ');
     try std.testing.expectEqualStrings(
-        " " ** 40 ++ "0123456789abcdef0" ++ "xy",
+        blank ++ "0123456789abcdef0" ++ "xy",
         context.data[0..context.len],
     );
     try std.testing.expectEqual(

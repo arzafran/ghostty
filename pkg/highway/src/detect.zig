@@ -20,8 +20,12 @@ const loongarch = @import("detect/loongarch.zig");
 /// This version uses only inline assembly (CPUID on x86, MRS on AArch64)
 /// and lightweight syscalls (sysctlbyname on Darwin, getauxval on Linux),
 /// so it adds no data tables and no std.Target dependency.
-pub export fn ghostty_hwy_detect_targets() callconv(.c) i64 {
-    return switch (builtin.cpu.arch) {
+///
+/// This is exported as `ghostty_hwy_detect_targets` for our patched
+/// targets.cpp to call. The symbol is hidden so that shared libraries that
+/// include this don't export it.
+fn detectTargets() callconv(.c) i64 {
+    return switch (builtin.target.cpu.arch) {
         .x86_64, .x86 => x86.detect(),
         .aarch64, .aarch64_be => detectAarch64(),
         .powerpc, .powerpc64, .powerpc64le => ppc.detect(),
@@ -32,15 +36,22 @@ pub export fn ghostty_hwy_detect_targets() callconv(.c) i64 {
     };
 }
 
+comptime {
+    @export(&detectTargets, .{
+        .name = "ghostty_hwy_detect_targets",
+        .visibility = .hidden,
+    });
+}
+
 fn detectAarch64() i64 {
     var t: HwyTargets = .{};
 
     // All AArch64 implementations have NEON.
     t.neon_without_aes = true;
 
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         return aarch64_darwin.detect(&t);
-    } else if (comptime builtin.os.tag == .linux) {
+    } else if (comptime builtin.target.os.tag == .linux) {
         return aarch64_linux.detect(&t);
     }
 
