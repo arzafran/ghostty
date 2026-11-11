@@ -752,6 +752,8 @@ pub fn init(
                 .rt_post_fork_info = .init(config),
                 .revive_fd = revive_fd,
                 .revive_pid = revive_pid,
+                .spawn_cb = if (comptime @hasDecl(apprt.runtime.Surface, "spawnCallback")) rt_surface.spawnCallback() else null,
+                .spawn_userdata = if (comptime @hasDecl(apprt.runtime.Surface, "spawnUserdata")) rt_surface.spawnUserdata() else null,
             });
             break :exec .{ .exec = io_exec };
         };

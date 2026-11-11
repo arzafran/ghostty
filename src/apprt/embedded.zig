@@ -462,6 +462,7 @@ pub const IoMode = enum(c_int) {
 };
 
 pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+pub const SpawnCallback = @import("../termio/Exec.zig").SpawnCallback;
 
 pub const Surface = struct {
     app: *App,
@@ -478,6 +479,8 @@ pub const Surface = struct {
     io_write_userdata: ?*anyopaque = null,
     revive_pty_fd: c_int = -1,
     revive_child_pid: i64 = -1,
+    spawn_cb: ?SpawnCallback = null,
+    spawn_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -544,6 +547,8 @@ pub const Surface = struct {
         /// Windows.
         revive_pty_fd: c_int = -1,
         revive_child_pid: i64 = -1,
+        spawn_cb: ?SpawnCallback = null,
+        spawn_userdata: ?*anyopaque = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -564,6 +569,8 @@ pub const Surface = struct {
             .io_write_userdata = opts.io_write_userdata,
             .revive_pty_fd = opts.revive_pty_fd,
             .revive_child_pid = opts.revive_child_pid,
+            .spawn_cb = opts.spawn_cb,
+            .spawn_userdata = opts.spawn_userdata,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -775,6 +782,14 @@ pub const Surface = struct {
     pub fn reviveChildPid(self: *const Surface) ?std.posix.pid_t {
         if (comptime builtin.os.tag == .windows) return null;
         return if (self.revive_child_pid >= 0) @intCast(self.revive_child_pid) else null;
+    }
+
+    pub fn spawnCallback(self: *const Surface) ?SpawnCallback {
+        return self.spawn_cb;
+    }
+
+    pub fn spawnUserdata(self: *const Surface) ?*anyopaque {
+        return self.spawn_userdata;
     }
 
     pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {

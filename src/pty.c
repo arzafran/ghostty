@@ -15,6 +15,8 @@
 
 #elif defined(__APPLE__)
 
+  #include <fcntl.h> // O_NOCTTY
+  #include <stdlib.h> // posix_openpt, grantpt, unlockpt
   #include <sys/ioctl.h> // ioctl and constants
   #include <sys/ttycom.h>  // ioctl and constants for TIOCPTYGNAME
   #include <sys/types.h>

@@ -137,7 +137,23 @@ const PosixPty = struct {
 
         var master_fd: Fd = undefined;
         var slave_fd: Fd = undefined;
-        if (c.openpty(
+        if (comptime builtin.os.tag == .macos) {
+            // openpty opens the slave without O_NOCTTY on macOS. The host
+            // must not acquire it before an embedder's child claims it.
+            master_fd = c.posix_openpt(c.O_RDWR | c.O_NOCTTY);
+            if (master_fd < 0) return error.OpenptyFailed;
+            errdefer _ = posix.system.close(master_fd);
+            if (c.grantpt(master_fd) != 0 or c.unlockpt(master_fd) != 0)
+                return error.OpenptyFailed;
+            var name: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
+            if (c.ioctl(master_fd, c.TIOCPTYGNAME, @intFromPtr(&name)) < 0)
+                return error.OpenptyFailed;
+            slave_fd = c.open(&name, c.O_RDWR | c.O_NOCTTY);
+            if (slave_fd < 0) return error.OpenptyFailed;
+            errdefer _ = posix.system.close(slave_fd);
+            if (c.ioctl(master_fd, c.TIOCSWINSZ, @intFromPtr(&sizeCopy)) < 0)
+                return error.OpenptyFailed;
+        } else if (c.openpty(
             &master_fd,
             &slave_fd,
             null,

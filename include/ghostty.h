@@ -530,6 +530,13 @@ typedef enum {
 
 typedef void (*ghostty_io_write_cb)(void* GHOSTTY_NULLABLE, const char*, uintptr_t);
 
+// Runs on the IO thread with borrowed, NULL-terminated argv/envp arrays.
+// Return the running process PID, or -1 to use Ghostty's normal spawn path.
+typedef int64_t (*ghostty_spawn_cb)(void* GHOSTTY_NULLABLE,
+                                   const char* GHOSTTY_NULLABLE const*,
+                                   const char* GHOSTTY_NULLABLE const*,
+                                   const char* GHOSTTY_NULLABLE, const char*);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -555,6 +562,8 @@ typedef struct {
   // Not supported on Windows.
   int revive_pty_fd;
   int64_t revive_child_pid;
+  ghostty_spawn_cb GHOSTTY_NULLABLE spawn_cb;
+  void* GHOSTTY_NULLABLE spawn_userdata;
 } ghostty_surface_config_s;
 
 typedef struct {

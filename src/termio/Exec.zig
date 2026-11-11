@@ -32,6 +32,14 @@ const compat_fd = @import("../lib/compat/fd.zig");
 
 const log = std.log.scoped(.io_exec);
 
+pub const SpawnCallback = *const fn (
+    ?*anyopaque,
+    [*:null]const ?[*:0]const u8,
+    [*:null]const ?[*:0]const u8,
+    ?[*:0]const u8,
+    [*:0]const u8,
+) callconv(.c) i64;
+
 /// The termios poll rate in milliseconds.
 const TERMIOS_POLL_MS = 200;
 
@@ -597,6 +605,8 @@ pub const Config = struct {
     /// Windows.
     revive_fd: ?posix.fd_t = null,
     revive_pid: ?posix.pid_t = null,
+    spawn_cb: ?SpawnCallback = null,
+    spawn_userdata: ?*anyopaque = null,
 };
 
 const Subprocess = struct {
@@ -618,6 +628,8 @@ const Subprocess = struct {
     /// honored on POSIX; ignored (stays null) on Windows.
     revive_fd: ?posix.fd_t = null,
     revive_pid: ?posix.pid_t = null,
+    spawn_cb: ?SpawnCallback = null,
+    spawn_userdata: ?*anyopaque = null,
 
     /// Union that represents the running process type.
     const Process = union(enum) {
@@ -923,6 +935,8 @@ const Subprocess = struct {
             .env = env,
             .cwd = cwd,
             .args = args,
+            .spawn_cb = cfg.spawn_cb,
+            .spawn_userdata = cfg.spawn_userdata,
 
             .rt_pre_exec_info = cfg.rt_pre_exec_info,
             .rt_post_fork_info = cfg.rt_post_fork_info,
@@ -1050,6 +1064,27 @@ const Subprocess = struct {
                 break :cwd null;
             }
         } else null;
+
+        if (comptime builtin.os.tag == .macos) {
+            if (self.spawn_cb) |spawn| {
+                if (pty.getProcessInfo(.tty_name)) |tty_path| {
+                    var arena = std.heap.ArenaAllocator.init(alloc);
+                    defer arena.deinit();
+                    const args = try arena.allocator().allocSentinel(?[*:0]const u8, self.args.len, null);
+                    for (self.args, 0..) |arg, i| args[i] = arg.ptr;
+                    const envp = if (self.env) |*env|
+                        (try Command.createNullDelimitedEnvMap(arena.allocator(), env)).ptr
+                    else
+                        std.c.environ;
+                    const pid = spawn(self.spawn_userdata, args.ptr, envp, if (cwd) |path| path.ptr else null, tty_path.ptr);
+                    if (pid > 0 and pid <= std.math.maxInt(posix.pid_t)) {
+                        self.process = .{ .attached = .{ .pid = @intCast(pid) } };
+                        return .{ .read = pty.master, .write = pty.master };
+                    }
+                    log.warn("embedder spawn failed, using fork/exec", .{});
+                }
+            }
+        }
 
         // In flatpak, we use the HostCommand to execute our shell.
         if (internal_os.isFlatpak()) flatpak: {
