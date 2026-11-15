@@ -2970,3 +2970,33 @@ test "kqueue: socket accept/cancel cancellation should decrease active count" {
     try loop.run(.until_done);
     try testing.expect(ln == 0);
 }
+
+test "kqueue: write to a full pipe reports WouldBlock" {
+    // Ordered stream writes retry the head request on WouldBlock. The
+    // backend must report a full non-blocking descriptor as WouldBlock
+    // rather than collapsing it into Unexpected, or the queue drops the
+    // buffer and the byte stream loses a chunk.
+    const testing = std.testing;
+
+    const fds = try xev_posix.pipe2(.{ .NONBLOCK = true });
+    defer xev_posix.close(fds[0]);
+    defer xev_posix.close(fds[1]);
+
+    var fill: [4096]u8 = @splat('x');
+    while (true) {
+        _ = xev_posix.write(fds[1], &fill) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+
+    var c: Completion = .{
+        .op = .{
+            .write = .{
+                .fd = fds[1],
+                .buffer = .{ .slice = &fill },
+            },
+        },
+    };
+    try testing.expectError(error.WouldBlock, c.perform(null).write);
+}
