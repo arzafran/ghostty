@@ -24,9 +24,9 @@
 
         // Zig libs
         .libxev = .{
-            // mitchellh/libxev
-            .url = "https://deps.files.ghostty.org/libxev-819ffa180ca20e31c7eded74e2e1aceb1eab557f.tar.gz",
-            .hash = "libxev-0.0.0-86vtc8QQFACz0sVc7U-VDiDIgH-XfBuEY5JpABLjHNpn",
+            // mitchellh/libxev 819ffa180ca20e31c7eded74e2e1aceb1eab557f,
+            // vendored to carry local patches; see vendor/libxev/VENDORED.md.
+            .path = "./vendor/libxev",
             .lazy = true,
         },
         .vaxis = .{
