@@ -1007,6 +1007,69 @@ test "run iterator: empty cells with background set" {
     }
 }
 
+test "run iterator: canonically equivalent NFC and NFD Hangul use the same font" {
+    // Korean typed in a terminal is usually NFC while macOS filenames are
+    // decomposed NFD jamo clusters. Both encodings of the same text must
+    // resolve to the same face. Pinning only the precomposed syllable block
+    // to a system font through a codepoint map (the
+    // `font-codepoint-map = U+AC00-U+D7A3=...` setup) means a decomposed
+    // cluster must resolve through the same mapping instead of per-jamo
+    // fallback discovery.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .jetbrains_mono);
+    defer testdata.deinit();
+
+    var disco = font.Discover.init(testdata.lib);
+    defer disco.deinit();
+    testdata.grid.resolver.discover = &disco;
+
+    // Ships with every macOS and covers Hangul syllables.
+    var map: font.CodepointMap = .{};
+    defer map.deinit(alloc);
+    try map.add(alloc, .{
+        .range = .{ 0xAC00, 0xD7A3 },
+        .descriptor = .{ .family = "Apple SD Gothic Neo" },
+    });
+    testdata.grid.resolver.codepoint_map = map;
+
+    const inputs = [_][]const u8{
+        // NFD first so its resolution cannot reuse faces that the NFC row
+        // loaded into the collection. Covers L+V and L+V+T clusters.
+        "\u{1112}\u{116C}\u{1100}\u{1168}\u{1107}\u{1165}\u{11B8}\u{110B}\u{1175}\u{11AB}",
+        // NFC: 회계법인
+        "\u{D68C}\u{ACC4}\u{BC95}\u{C778}",
+    };
+
+    var indexes: [inputs.len]font.Collection.Index = undefined;
+    for (inputs, 0..) |input, i| {
+        var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 3 });
+        defer t.deinit(alloc);
+
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(input);
+
+        var state: terminal.RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &t);
+
+        var shaper = &testdata.shaper;
+        var it = shaper.runIterator(.{
+            .grid = testdata.grid,
+            .cells = state.row_data.get(0).cells.slice(),
+        });
+        const run = (try it.next(alloc)).?;
+
+        try testing.expect(run.font_index.special() == null);
+        try testing.expect(try it.next(alloc) == null);
+        indexes[i] = run.font_index;
+    }
+
+    try testing.expectEqual(indexes[1], indexes[0]);
+}
+
 test "shape" {
     const testing = std.testing;
     const alloc = testing.allocator;
