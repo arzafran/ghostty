@@ -1530,6 +1530,9 @@ fn mapReadError(err: anyerror) ReadError {
 fn mapWriteError(err: anyerror) WriteError {
     return switch (err) {
         error.AccessDenied, error.PermissionDenied => error.PermissionDenied,
+        // Keep backpressure distinct so ordered stream writes can retry the
+        // same buffer instead of dropping it.
+        error.WouldBlock => error.WouldBlock,
         else => error.Unexpected,
     };
 }
@@ -1732,6 +1735,7 @@ pub const ReadError = KEventError || error{
 pub const WriteError = KEventError || error{
     Canceled,
     PermissionDenied,
+    WouldBlock,
     Unexpected,
 };
 

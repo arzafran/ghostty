@@ -1026,26 +1026,47 @@ pub fn Writeable(comptime xev: type, comptime T: type, comptime options: Options
                     const cb_res = write_result(c_inner, r);
                     var result: xev.WriteError!usize = cb_res.result;
 
-                    // Checks whether the entire buffer was written, this is
-                    // necessary to guarantee correct ordering of writes.
-                    // If the write was partial, it re-submits the remainder of
-                    // the buffer.
                     const queued_len = writeBufferLength(cb_res.buf);
-                    if (cb_res.result) |written_len| {
-                        if (written_len < queued_len) {
-                            // Write remainder of the buffer, reusing the same completion
-                            const rem_buf = writeBufferRemainder(cb_res.buf, written_len);
-                            cb_res.writer.writeInit(&req_inner.completion, rem_buf);
-                            req_inner.completion.userdata = q_inner;
-                            req_inner.completion.callback = callback;
-                            l_inner.add(&req_inner.completion);
-                            return .disarm;
-                        }
+                    const retry_buffer: ?xev.WriteBuffer = retry: {
+                        // Keep the head request until every byte is accepted.
+                        // Advancing on partial progress or transient
+                        // backpressure would create a hole in the ordered
+                        // byte stream.
+                        if (cb_res.result) |written_len| {
+                            if (written_len < queued_len) {
+                                break :retry writeBufferRemainder(
+                                    cb_res.buf,
+                                    written_len,
+                                );
+                            }
 
-                        // We wrote the entire buffer, modify the result to indicate
-                        // to the caller that all bytes have been written.
-                        result = writeBufferLength(req_inner.full_write_buffer);
-                    } else |_| {}
+                            // We wrote the entire buffer, modify the result to
+                            // indicate to the caller that all bytes have been
+                            // written.
+                            result = writeBufferLength(
+                                req_inner.full_write_buffer,
+                            );
+                            break :retry null;
+                        } else |err| switch (@as(anyerror, err)) {
+                            // anyerror keeps this branch valid for backends
+                            // whose WriteError cannot contain WouldBlock.
+                            error.WouldBlock => break :retry cb_res.buf,
+                            else => break :retry null,
+                        }
+                    };
+
+                    if (retry_buffer) |pending_buffer| {
+                        // Reuse the current request in place so later queued
+                        // writes cannot overtake it.
+                        cb_res.writer.writeInit(
+                            &req_inner.completion,
+                            pending_buffer,
+                        );
+                        req_inner.completion.userdata = q_inner;
+                        req_inner.completion.callback = callback;
+                        l_inner.add(&req_inner.completion);
+                        return .disarm;
+                    }
 
                     // We can pop previously peeked request.
                     _ = q_inner.pop().?;
