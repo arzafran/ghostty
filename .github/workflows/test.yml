@@ -71,7 +71,12 @@ jobs:
       - id: determine
         name: Determine skip
         run: |
-          if [ "${{ steps.filter_every.outputs.code }}" = "false" ]; then
+          # The filters diff the pushed ref against main, so a tag on a
+          # commit of main has no changed files and would skip every job.
+          # A tag is a release, so it always runs the tests.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.filter_every.outputs.code }}" = "false" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -426,11 +431,13 @@ jobs:
       - name: Install zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
 
+      # The release zips are built with ReleaseFast, so this job checks that
+      # build. The unit tests run in Debug in build-libghostty-vt-windows.
       - name: Install libghostty-vt
         shell: pwsh
         run: |
           $prefix = Join-Path $env:RUNNER_TEMP "ghostty-vt"
-          zig build -Demit-lib-vt -Dtarget=x86_64-windows-gnu --prefix $prefix
+          zig build -Demit-lib-vt -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast --prefix $prefix
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem $prefix -Recurse -File |
             ForEach-Object { $_.FullName.Substring($prefix.Length + 1) }
@@ -439,67 +446,57 @@ jobs:
         shell: pwsh
         run: |
           $prefix = Join-Path $env:RUNNER_TEMP "ghostty-vt"
-          $expected = @(
-            "bin/ghostty-vt.dll"
-            "lib/ghostty-vt.lib"
-            "lib/ghostty-vt-static.lib"
-            "include/ghostty/vt.h"
-            "include/ghostty/vt"
-            "lib/pkgconfig/libghostty-vt.pc"
-            "lib/pkgconfig/libghostty-vt-static.pc"
-            "lib/cmake/ghostty-vt/ghostty-vt-config.cmake"
-            "lib/cmake/ghostty-vt/ghostty-vt-config-version.cmake"
-          )
-          $missing = $expected | Where-Object { -not (Test-Path (Join-Path $prefix $_)) }
-          if ($missing) {
-            "missing from the install tree: $($missing -join ', ')"
+          # The pkg-config files must find the tree relative to their own
+          # location, so the tree works wherever it is unzipped.
+          $pcs = @("libghostty-vt.pc", "libghostty-vt-static.pc") |
+            ForEach-Object { Join-Path $prefix "lib/pkgconfig/$_" }
+          $absolute = $pcs | Where-Object {
+            -not (Select-String -Path $_ -SimpleMatch -Pattern 'prefix=${pcfiledir}/' -Quiet)
+          }
+          if ($absolute) {
+            Get-Content $absolute
+            "pkg-config files don't use `${pcfiledir}: $($absolute -join ', ')"
             exit 1
           }
 
-          # The text files must not name the build directory. The DLL and
-          # its PDB are left out: debug info names the source files.
+          # The text files must not name the build directory or the
+          # install prefix. The DLL and its PDB are left out: debug info
+          # names the source files. check-windows-libghostty-vt.ps1 checks
+          # the file list later.
           $workspace = $env:GITHUB_WORKSPACE
-          $patterns = @($workspace, $workspace.Replace('\', '/')) | Sort-Object -Unique
+          $patterns = @(
+            $workspace, $workspace.Replace('\', '/'),
+            $prefix, $prefix.Replace('\', '/')
+          ) | Sort-Object -Unique
           $leaks = Get-ChildItem $prefix -Recurse -File -Include *.h, *.pc, *.cmake |
             Select-String -SimpleMatch -Pattern $patterns
           if ($leaks) {
             $leaks
-            "installed files name the build directory"
+            "installed files name the build directory or the install prefix"
+            exit 1
+          }
+
+      # A release zip holds this same tree, unpacked wherever the user
+      # chooses. Moving the tree before the consumer runs catches anything
+      # that still points at the directory it was built in.
+      - name: Relocate the install tree
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP "ghostty-vt"
+          $relocated = Join-Path $env:RUNNER_TEMP "relocated"
+          New-Item -ItemType Directory -Force $relocated | Out-Null
+          Move-Item -LiteralPath $prefix -Destination (Join-Path $relocated "ghostty-vt")
+          if (Test-Path -LiteralPath $prefix) {
+            "the old prefix still exists: $prefix"
             exit 1
           }
 
       - name: Build and run a CMake consumer
         shell: pwsh
         run: |
-          $prefix = Join-Path $env:RUNNER_TEMP "ghostty-vt"
-          $consumer = Join-Path $env:RUNNER_TEMP "consumer"
-          New-Item -ItemType Directory -Force $consumer | Out-Null
-          @'
-          cmake_minimum_required(VERSION 3.19)
-          project(consumer C)
-          find_package(ghostty-vt CONFIG REQUIRED)
-          add_executable(consumer main.c)
-          target_link_libraries(consumer PRIVATE ghostty-vt::ghostty-vt)
-          '@ | Set-Content (Join-Path $consumer "CMakeLists.txt")
-          @'
-          #include <ghostty/vt.h>
-          int main(void) {
-              bool simd = false;
-              return ghostty_build_info(GHOSTTY_BUILD_INFO_SIMD, &simd) == GHOSTTY_SUCCESS ? 0 : 1;
-          }
-          '@ | Set-Content (Join-Path $consumer "main.c")
-
-          cmake -S $consumer -B "$consumer/build" "-DCMAKE_PREFIX_PATH=$prefix"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build "$consumer/build" --config Release
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          # Windows finds DLLs on PATH; there is no rpath.
-          $env:PATH = "$prefix\bin;$env:PATH"
-          & "$consumer/build/Release/consumer.exe"
-          $code = $LASTEXITCODE
-          "exit code: 0x{0:X8}" -f $code
-          exit $code
+          ./.github/scripts/check-windows-libghostty-vt.ps1 `
+            -Prefix (Join-Path $env:RUNNER_TEMP "relocated/ghostty-vt") `
+            -WorkDir (Join-Path $env:RUNNER_TEMP "consumer")
 
   build-examples-swift:
     strategy:
@@ -864,6 +861,7 @@ jobs:
             aarch64-freebsd,
             x86_64-freebsd,
             x86_64-windows-gnu,
+            aarch64-windows-gnu,
             # doesn't work yet, we need a way to find msvc libc/c++ headers
             # x86_64-windows-msvc
           ]
@@ -1035,8 +1033,28 @@ jobs:
           nix develop -c node test/wasm-alloc.mjs ghostty-vt-small.wasm
 
   # Compile-only checks for the -Dvt-features flags so that future changes
-  # don't regress any feature combination.
+  # don't regress any feature combination. The matrix covers every feature
+  # off, and each feature on by itself. The wasm library build compiles the
+  # C API exports, and the test build compiles every module test without
+  # running any. Each configuration is a full compile, so each gets its own
+  # job and they all run in parallel.
   build-libghostty-vt-features:
+    strategy:
+      fail-fast: false
+      matrix:
+        vt-features:
+          - "-all"
+          - "-all,+snapshot"
+          - "-all,+formatter"
+          - "-all,+selection"
+          - "-all,+render_state"
+          - "-all,+input_encode"
+          - "-all,+color"
+          - "-all,+grid_introspection"
+          - "-all,+glyph_protocol"
+          - "-all,+kitty_graphics"
+          - "-all,+search"
+    name: libghostty-vt -Dvt-features=${{ matrix.vt-features }}
     runs-on: namespace-profile-ghostty-sm
     needs: build-gate
     env:
@@ -1062,28 +1080,22 @@ jobs:
           name: ghostty
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
-      - name: Compile feature flag matrix
+      - name: Build wasm library
         run: |
-          features="snapshot formatter selection render_state input_encode color grid_introspection glyph_protocol kitty_graphics search"
-          configs="-all"
-          for f in $features; do configs="$configs -all,+$f"; done
+          nix develop -c zig build -Demit-lib-vt \
+            "-Dvt-features=${{ matrix.vt-features }}" \
+            -Dtarget=wasm32-freestanding
 
-          for cfg in $configs; do
-            echo "::group::-Dvt-features=$cfg"
-            # The wasm lib build compiles the C API export block; the
-            # test build compiles every module test without running any.
-            nix develop -c zig build -Demit-lib-vt \
-              "-Dvt-features=$cfg" \
-              -Dtarget=wasm32-freestanding
-            nix develop -c zig build test-lib-vt-build \
-              "-Dvt-features=$cfg"
-            echo "::endgroup::"
-          done
+      - name: Build tests
+        run: |
+          nix develop -c zig build test-lib-vt-build \
+            "-Dvt-features=${{ matrix.vt-features }}"
 
       # Functions of a compiled-out feature must return
       # GHOSTTY_UNSUPPORTED. Most module tests assume their feature is
       # on, so only this one test runs with every feature off.
       - name: Test compiled-out features
+        if: matrix.vt-features == '-all'
         run: |
           nix develop -c zig build test-lib-vt \
             -Dvt-features=-all \
@@ -1259,6 +1271,31 @@ jobs:
             -Dtarget=${{ matrix.target }} \
             -Demit-xcframework=${{ matrix.xcframework }}
 
+      # Our Apple static archives must not define libc functions. An
+      # app that links one would use our definition in place of
+      # libSystem's for its whole binary, and would fail to link if it
+      # defines the same function itself. See src/quirks_memset.zig.
+      - name: Verify static archive does not define libc symbols
+        run: |
+          archives=(zig-out/lib/libghostty-vt.a)
+          if [ "${{ matrix.xcframework }}" = "true" ]; then
+            xcf_archives=$(find zig-out/lib/ghostty-vt.xcframework -name '*.a')
+            # Fail if no archives were found, so a change to the
+            # xcframework layout can't silently skip this check.
+            test -n "$xcf_archives"
+            while IFS= read -r a; do archives+=("$a"); done <<< "$xcf_archives"
+          fi
+          for a in "${archives[@]}"; do
+            # Save nm's output before grepping it. If nm failed inside
+            # a pipeline, the step would still pass, because this shell
+            # does not set pipefail.
+            syms=$(nm -gU "$a")
+            if grep -E ' [A-Z] _(memset|memcpy|memmove|memcmp|bcmp|strlen)$' <<< "$syms"; then
+              echo "$a defines libc symbols" >&2
+              exit 1
+            fi
+          done
+
       - name: Verify Apple dylib
         run: |
           nix develop -c nu .github/scripts/check-apple-libghostty-vt.nu \
@@ -1329,8 +1366,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # setup-zig points both Zig caches at one directory and saves it
+      # with the actions cache. If the directory is over the size limit
+      # when the job ends, it saves an empty cache instead and the next
+      # run starts cold: it fetches every dependency and rebuilds all of
+      # them, which takes about twice as long as a warm test step. A cold
+      # run leaves about 1.8 GB here and every run after it adds the test
+      # binaries it built, more than 1 GB, so the 2 GiB default cleared
+      # the cache on every second run.
       - name: Setup Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          cache-size-limit: 8192
 
       - name: Test libghostty-vt
         run: zig build test-lib-vt
@@ -1602,8 +1649,11 @@ jobs:
       - name: Check Source Tarball
         run: nix develop -c zig build distcheck
 
+  # Builds the libghostty-vt tarball, then builds the library and runs
+  # the tests from inside it. That is about as much work as test-lib-vt,
+  # so it gets the same runner.
   build-dist-lib-vt:
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: namespace-profile-ghostty-md
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
@@ -1765,14 +1815,10 @@ jobs:
       - name: Xcode Version
         run: xcodebuild -version
 
-      - name: get the Zig deps
-        id: deps
-        run: nix build -L .#deps && echo "deps=$(readlink ./result)" >> $GITHUB_OUTPUT
-
       # GhosttyKit is the framework that is built from Zig for our native
       # Mac app to access.
       - name: Build GhosttyKit
-        run: nix develop -c zig build --system ${{ steps.deps.outputs.deps }} -Demit-macos-app=false
+        run: nix develop -c zig build -Demit-macos-app=false
 
       # The native app is built with native Xcode tooling. This also does
       # codesigning. IMPORTANT: this must NOT run in a Nix environment.
@@ -1817,12 +1863,8 @@ jobs:
       - name: Xcode Version
         run: xcodebuild -version
 
-      - name: get the Zig deps
-        id: deps
-        run: nix build -L .#deps && echo "deps=$(readlink ./result)" >> $GITHUB_OUTPUT
-
       - name: Build with Xcode 27
-        run: nix develop -c zig build --system ${{ steps.deps.outputs.deps }} -Demit-macos-app=false
+        run: nix develop -c zig build -Demit-macos-app=false
 
   build-macos-freetype:
     runs-on: namespace-profile-ghostty-macos-golden
@@ -1857,19 +1899,15 @@ jobs:
       - name: Xcode Version
         run: xcodebuild -version
 
-      - name: get the Zig deps
-        id: deps
-        run: nix build -L .#deps && echo "deps=$(readlink ./result)" >> $GITHUB_OUTPUT
-
       # We run tests with an empty test filter so it runs all unit tests
       # but skips Xcode tests
       - name: Test All
         run: |
-          nix develop -c zig build test --system ${{ steps.deps.outputs.deps }} -Drenderer=metal -Dfont-backend=coretext_freetype -Dtest-filter=""
+          nix develop -c zig build test -Drenderer=metal -Dfont-backend=coretext_freetype -Dtest-filter=""
 
       - name: Build All
         run: |
-          nix develop -c zig build --system ${{ steps.deps.outputs.deps }} -Demit-macos-app=false -Drenderer=metal -Dfont-backend=coretext_freetype
+          nix develop -c zig build -Demit-macos-app=false -Drenderer=metal -Dfont-backend=coretext_freetype
 
   # A quick x86_64 Linux build that expensive jobs wait on so we don't
   # pay for them when Ghostty doesn't even compile. Cheap jobs only
@@ -2113,19 +2151,38 @@ jobs:
 
       # Builds ghostty-vt-c-test into zig-out/bin, where vm.sh test looks
       # for it. It runs every libghostty-vt test, the Zig ones included.
-      - name: Build the test binary
+      #
+      # The VM is set up at the same time, in the background, since neither
+      # needs the other. setup does nothing once the cache volume holds a
+      # set-up VM. Otherwise it downloads FreeBSD and boots it once, which
+      # takes a few minutes that now pass while the tests build. reset then
+      # undoes whatever the last run's tests left on the VM's disk. Their
+      # output goes to a file and is printed in its own log group once both
+      # have finished, so it never mixes with the build's.
+      - name: Build the test binary and set up the VM
         run: |
+          (
+            nix develop -c .github/scripts/freebsd-vm/vm.sh setup &&
+              nix develop -c .github/scripts/freebsd-vm/vm.sh reset
+          ) >"$RUNNER_TEMP/vm-setup.log" 2>&1 &
+          vm=$!
+          build=0
           nix develop -c zig build test-lib-vt-build \
             -Demit-lib-vt \
             -Demit-test-exe \
-            -Dtarget=x86_64-freebsd
-
-      # setup does nothing once the cache volume holds a set-up VM. reset
-      # then undoes whatever the last run's tests left on the VM's disk.
-      - name: Set up the VM
-        run: |
-          nix develop -c .github/scripts/freebsd-vm/vm.sh setup
-          nix develop -c .github/scripts/freebsd-vm/vm.sh reset
+            -Dtarget=x86_64-freebsd || build=$?
+          setup=0
+          wait "$vm" || setup=$?
+          echo "::group::Set up the VM"
+          cat "$RUNNER_TEMP/vm-setup.log"
+          echo "::endgroup::"
+          if [ "$build" -ne 0 ]; then
+            echo "::error title=Build failed::zig build exited with status $build"
+          fi
+          if [ "$setup" -ne 0 ]; then
+            echo "::error title=VM setup failed::vm.sh exited with status $setup"
+          fi
+          [ "$build" -eq 0 ] && [ "$setup" -eq 0 ]
 
       - name: Start the VM
         run: nix develop -c .github/scripts/freebsd-vm/vm.sh start
@@ -2232,7 +2289,10 @@ jobs:
         x11: ["true", "false"]
         wayland: ["true", "false"]
     name: GTK x11=${{ matrix.x11 }} wayland=${{ matrix.wayland }}
-    runs-on: namespace-profile-ghostty-sm
+    # Only the x11=true wayland=true leg runs the test suite (see the Test
+    # step below), so it gets the larger runner. The build-only legs stay
+    # on the small one.
+    runs-on: ${{ matrix.x11 == 'true' && matrix.wayland == 'true' && 'namespace-profile-ghostty-md' || 'namespace-profile-ghostty-sm' }}
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
@@ -2285,7 +2345,7 @@ jobs:
         # -Dsimd=true is the default, which the GTK tests already cover.
         simd: ["false"]
     name: Test -Dsimd=${{ matrix.simd }}
-    runs-on: namespace-profile-ghostty-sm
+    runs-on: namespace-profile-ghostty-md
     needs: build-gate
     env:
       ZIG_LOCAL_CACHE_DIR: /zig/local-cache
@@ -2382,12 +2442,8 @@ jobs:
       - name: Xcode Version
         run: xcodebuild -version
 
-      - name: get the Zig deps
-        id: deps
-        run: nix build -L .#deps && echo "deps=$(readlink ./result)" >> $GITHUB_OUTPUT
-
       - name: test
-        run: nix develop -c zig build test --system ${{ steps.deps.outputs.deps }}
+        run: nix develop -c zig build test
 
   test-i18n:
     strategy:

@@ -190,6 +190,7 @@ ibaios
 icodesign
 -ifmael
 illiakrauchanka
+inv1x
 j-c-m
 j0hnm4r5
 jacobsandlund
@@ -203,8 +204,10 @@ jesusvazquez
 jglanz
 jguthmiller
 jin-eden
+-jischeng
 jmcgover
 jmr
+johnrichardrinehart
 johnslavik
 jordandm
 josephmart
@@ -232,6 +235,7 @@ konstantinhudyakov
 koranir
 korikhin
 kostich
+krios2146
 kristina8888
 kristofersoler
 kylesower
@@ -271,12 +275,14 @@ minorcell
 misairuzame
 mischief
 mistertea
+-misterwanted holy meat proxy
 mitchellh
 miupa
 mjbommar
 mlabbe
 mohshami
 molechowski
+montmejat
 moonmao42
 moonward
 -morgengeluk Appears to be using AI inappropriately even after it was requested they abide by the AI policy (there is clear evidence of the person-in-the-loop not attempting to clean up AI generated text, and their AI disclosure itself reads like AI-generated text and shows no signs of remorse or intent to improve).
@@ -290,6 +296,7 @@ nagato-yuzuru
 natesmyth
 neo773
 neobrain
+neomantra
 neoto
 neurosnap
 nicholas-ochoa
@@ -301,6 +308,7 @@ nmggithub
 noib3
 nolinmcfarland
 nouritsu
+nurpax
 nwehg
 ocean6954
 ollieatkinson

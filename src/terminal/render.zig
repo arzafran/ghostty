@@ -1251,24 +1251,30 @@ pub const RenderState = struct {
 
                     for (page_rows[i..][0..RowDirtyMask.group_len], i..) |*page_row, j| {
                         if (!page_row.dirty) continue;
-                        page_row.dirty = false;
                         any_dirty = true;
                         try builder.row(p, page_row, y + j);
+                        page_row.dirty = false;
                     }
                 }
                 while (i < take) : (i += 1) {
                     const page_row = &page_rows[i];
                     if (!page_row.dirty) continue;
-                    page_row.dirty = false;
                     any_dirty = true;
                     try builder.row(p, page_row, y + i);
+                    page_row.dirty = false;
                 }
             } else {
                 // Rebuild every row in the chunk.
                 any_dirty = true;
                 for (page_rows, 0..) |*page_row, i| {
+                    builder.row(p, page_row, y + i) catch |err| {
+                        // A failed row and every row not yet rebuilt must stay
+                        // dirty so the next update cannot skip them and expose
+                        // partially initialized managed cell data.
+                        for (page_rows[i..]) |*remaining| remaining.dirty = true;
+                        return err;
+                    };
                     page_row.dirty = false;
-                    try builder.row(p, page_row, y + i);
                 }
             }
 
@@ -1425,14 +1431,15 @@ pub const RenderState = struct {
         // Process the pending runs one row segment at a time. All the
         // runs for a row are appended contiguously by a single
         // beginUpdate, so a segment boundary is simply a change in y.
-        const runs = self.pending_styles.items;
-        var i: usize = 0;
-        while (i < runs.len) {
-            const y = runs[i].y;
-            var j = i + 1;
-            while (j < runs.len and runs[j].y == y) j += 1;
-            const segment = runs[i..j];
-            i = j;
+        //
+        // We consume the runs as a shrinking slice to reduce per-segment setup.
+        var rest = self.pending_styles.items;
+        while (rest.len > 0) {
+            const y = rest[0].y;
+            var n: usize = 1;
+            while (n < rest.len and rest[n].y == y) n += 1;
+            const segment = rest[0..n];
+            rest = rest[n..];
 
             // Defensive: the row data may have changed shape if the
             // caller violated ordering (e.g. an error path skipped an
@@ -1451,9 +1458,12 @@ pub const RenderState = struct {
             const applied = &row_applied[y];
             if (runsEql(applied.items, segment)) continue;
 
+            const cells = row_cells[y].slice();
+            const styles = cells.items(.style);
             for (segment) |run| {
-                const styles = row_cells[run.y].slice().items(.style);
-                const end = @min(run.end, styles.len);
+                // Clamp to cells.len rather than styles.len to avoid repeating
+                // the capacity check from items(.style) for every run.
+                const end = @min(run.end, cells.len);
                 const start = @min(run.start, end);
 
                 fillStyles(styles[start..end], @bitCast(run.style));
@@ -2686,8 +2696,10 @@ const RowBuilder = struct {
         // Get all our cells in the page.
         const page_cells: []const page.Cell = page_row.cells.ptr(p.memory)[0..b.cols];
 
-        // Copy our raw row data
+        // Copy our raw row data. The terminal row stays dirty until the
+        // build succeeds, but the render-state snapshot is always rebuilt.
         b.raws[vy] = page_row.*;
+        b.raws[vy].dirty = false;
 
         // Note: our cells MultiArrayList uses our general allocator.
         // We do this on purpose because as rows become dirty, we do
@@ -6042,4 +6054,31 @@ test "placements_generation: changes on a region scroll that moves a fixed place
     try state.update(alloc, &t);
     try testing.expectEqual(2, (try testOnlyPlacement(&state)).y);
     try testing.expect(generation != state.imagePlacementsGeneration());
+}
+
+test "render update retries rows after OOM" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .cols = 2, .rows = 1 });
+    defer t.deinit(alloc);
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("x");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    state.clean();
+    stream.nextSlice("e\xcc\x81");
+
+    // The next render-state allocation is the grapheme copy.
+    var failing = testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, state.update(failing.allocator(), &t));
+    try state.update(alloc, &t);
+
+    const cells = state.row_data.items(.cells)[0].slice();
+    try testing.expectEqualSlices(u21, &.{0x301}, cells.items(.grapheme)[1]);
 }

@@ -6,14 +6,16 @@ libghostty-vt is a normal C library. There are several official ways to get it:
   with @ref installing-pkg-config "pkg-config".
 - **CMake:** @ref installing-cmake "let CMake fetch and build it" for you.
 - **Zig:** @ref installing-zig "add it as a dependency".
+- **Windows:** download the prebuilt @ref installing-windows "DLL and static
+  library".
 - **Swift or another Apple project:** download the prebuilt @ref
   installing-swift "XCFramework".
 - **The web or JavaScript:** download the prebuilt @ref installing-wasm
   "WebAssembly module".
 - **Nix:** @ref installing-nix "use our flake".
 
-We don't publish prebuilt packages for Linux, FreeBSD or Windows. On
-those systems, you build from source or use your system's package if it has one.
+We don't publish prebuilt packages for Linux or FreeBSD. On those systems, you
+build from source or use your system's package if it has one.
 
 Every method that builds the library needs [Zig](https://ziglang.org) 0.17. You
 don't need to know any Zig to do it. The build stops with an error on any other
@@ -29,18 +31,20 @@ and its own `vt-X.Y.Z` tags. Each release is published to one directory:
 https://release.files.ghostty.org/libghostty-vt/VERSION/
 ```
 
-`VERSION` is the version number with no prefix, such as `1.0.0`. The directory
+`VERSION` is the version number with no prefix, such as `1.0.1`. The directory
 has the following files:
 
-| File                                 | Contents                                  |
-| ------------------------------------ | ----------------------------------------- |
-| `libghostty-vt-VERSION.tar.gz`       | Source tarball                            |
-| `libghostty-vt-VERSION-deps.tar.gz`  | Zig packages for building with no network |
-| `libghostty-vt-VERSION-docs.zip`     | This documentation as HTML                |
-| `ghostty-vt-VERSION.xcframework.zip` | Static libraries for macOS and iOS        |
-| `ghostty-vt-VERSION.wasm`            | WebAssembly module, optimized for speed   |
-| `ghostty-vt-VERSION-small.wasm`      | WebAssembly module, optimized for size    |
-| `SHA256SUMS`                         | Checksums of all of the above             |
+| File                                         | Contents                                  |
+| -------------------------------------------- | ----------------------------------------- |
+| `libghostty-vt-VERSION.tar.gz`               | Source tarball                            |
+| `libghostty-vt-VERSION-deps.tar.gz`          | Zig packages for building with no network |
+| `libghostty-vt-VERSION-docs.zip`             | This documentation as HTML                |
+| `ghostty-vt-VERSION-x86_64-windows-gnu.zip`  | DLL and static library for Windows x86_64 |
+| `ghostty-vt-VERSION-aarch64-windows-gnu.zip` | DLL and static library for Windows arm64  |
+| `ghostty-vt-VERSION.xcframework.zip`         | Static libraries for macOS and iOS        |
+| `ghostty-vt-VERSION.wasm`                    | WebAssembly module, optimized for speed   |
+| `ghostty-vt-VERSION-small.wasm`              | WebAssembly module, optimized for size    |
+| `SHA256SUMS`                                 | Checksums of all of the above             |
 
 **Verifying a download:** every file has a
 [minisign](https://jedisct1.github.io/minisign/) signature next to it, with a
@@ -66,7 +70,7 @@ as a `binaryTarget`:
 ```swift
 .binaryTarget(
     name: "GhosttyVt",
-    url: "https://release.files.ghostty.org/libghostty-vt/1.0.0/ghostty-vt-1.0.0.xcframework.zip",
+    url: "https://release.files.ghostty.org/libghostty-vt/1.0.1/ghostty-vt-1.0.1.xcframework.zip",
     checksum: "<sha256 of the zip>"
 ),
 ```
@@ -107,6 +111,64 @@ See [wasm-vt](https://github.com/ghostty-org/ghostty/tree/main/example/wasm-vt)
 for how to load it from JavaScript, and @ref wasm "WebAssembly" for the
 functions that only exist for this build.
 
+## Windows {#installing-windows}
+
+We publish a zip for Windows x86_64 and arm64. Both are built for the
+gnu ABI, and MSVC, clang and mingw programs can all link them. We test the
+x86_64 zip at release. The arm64 zip is built the same way, in CI and at
+release, but never run.
+
+Download and verify the zip, then unzip it:
+
+```powershell
+curl.exe -LO https://release.files.ghostty.org/libghostty-vt/1.0.1/ghostty-vt-1.0.1-x86_64-windows-gnu.zip
+curl.exe -LO https://release.files.ghostty.org/libghostty-vt/1.0.1/ghostty-vt-1.0.1-x86_64-windows-gnu.zip.minisig
+minisign -V -P RWQlAjJC23149WL2sEpT/l0QKy7hMIFhYdQOFy0Z7z7PbneUgvlsnYcV -m ghostty-vt-1.0.1-x86_64-windows-gnu.zip
+Expand-Archive ghostty-vt-1.0.1-x86_64-windows-gnu.zip -DestinationPath .
+```
+
+It unpacks to one directory named after the zip. `bin/` has `ghostty-vt.dll`
+and its `ghostty-vt.pdb`, `lib/` has the import library `ghostty-vt.lib` and the
+static library `ghostty-vt-static.lib`, and `include/` has the headers. `lib/`
+also has the CMake and pkg-config files.
+
+Point CMake at that directory and link the DLL:
+
+```cmake
+find_package(ghostty-vt CONFIG REQUIRED)
+target_link_libraries(hello PRIVATE ghostty-vt::ghostty-vt)
+```
+
+```powershell
+cmake -B build -DCMAKE_PREFIX_PATH=C:/path/to/ghostty-vt-1.0.1-x86_64-windows-gnu
+```
+
+Without CMake, compile with the `include` directory and link
+`lib/ghostty-vt.lib`, such as `cl /I include hello.c lib\ghostty-vt.lib`.
+
+**At run time,** `ghostty-vt.dll` must be on `PATH` or next to your `.exe`.
+It only imports ntdll, kernel32 and the Universal C Runtime, so there is no
+redistributable to install. Keep `ghostty-vt.pdb` next to the DLL so stack
+traces show function names.
+
+**The static library** works with clang, mingw and Zig, but not with MSVC's
+`link.exe`, which rejects some of its symbols and sections. With MSVC, use the
+DLL. The CMake target `ghostty-vt::ghostty-vt-static` and
+`libghostty-vt-static.pc` define `GHOSTTY_STATIC` for you. If you call the
+compiler yourself, define it, or the headers declare every function as imported
+from the DLL. Also link ntdll:
+
+```powershell
+clang -DGHOSTTY_STATIC -I include hello.c lib\ghostty-vt-static.lib -lntdll -o hello.exe
+```
+
+To build it yourself, run this from a checkout to get the same files in
+`zig-out/`:
+
+```sh
+zig build -Demit-lib-vt -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast
+```
+
 ## CMake {#installing-cmake}
 
 CMake can fetch and build the library for you, so you can skip the build below.
@@ -115,7 +177,7 @@ You still need `zig` on your `PATH`.
 ```cmake
 include(FetchContent)
 FetchContent_Declare(ghostty
-    URL https://release.files.ghostty.org/libghostty-vt/1.0.0/libghostty-vt-1.0.0.tar.gz
+    URL https://release.files.ghostty.org/libghostty-vt/1.0.1/libghostty-vt-1.0.1.tar.gz
     URL_HASH SHA256=<sha256 of the tarball>
 )
 FetchContent_MakeAvailable(ghostty)
@@ -141,7 +203,7 @@ c-vt-cmake-cross/src/main.c "c-vt-cmake-cross" and the
 Zig programs can use the Zig module directly, which skips the C API:
 
 ```sh
-zig fetch --save=ghostty https://release.files.ghostty.org/libghostty-vt/1.0.0/libghostty-vt-1.0.0.tar.gz
+zig fetch --save=ghostty https://release.files.ghostty.org/libghostty-vt/1.0.1/libghostty-vt-1.0.1.tar.gz
 ```
 
 Then import the module in your `build.zig`:
@@ -162,7 +224,7 @@ c-vt-stream/src/main.c "c-vt-stream" does.
 Our flake has a `libghostty-vt` package, built with `ReleaseFast`:
 
 ```sh
-nix build 'github:ghostty-org/ghostty/vt-1.0.0#libghostty-vt^*'
+nix build 'github:ghostty-org/ghostty/vt-1.0.1#libghostty-vt^*'
 ```
 
 The `^*` builds every output. The default output has the shared library, and the
@@ -174,9 +236,9 @@ files.
 Download a source tarball and build it:
 
 ```sh
-curl -LO https://release.files.ghostty.org/libghostty-vt/1.0.0/libghostty-vt-1.0.0.tar.gz
-tar -xzf libghostty-vt-1.0.0.tar.gz
-cd libghostty-vt-1.0.0
+curl -LO https://release.files.ghostty.org/libghostty-vt/1.0.1/libghostty-vt-1.0.1.tar.gz
+tar -xzf libghostty-vt-1.0.1.tar.gz
+cd libghostty-vt-1.0.1
 zig build -Doptimize=ReleaseFast --prefix "$HOME/.local"
 ```
 
