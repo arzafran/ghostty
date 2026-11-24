@@ -1691,15 +1691,12 @@ fn searchCallback_(
 /// The renderer state mutex MUST NOT be held.
 fn modsChanged(self: *Surface, mods: input.Mods) void {
     // The only place we keep track of mods currently is on the mouse.
-    // Compare binding mods against binding mods: we only ever store
-    // binding modifiers, so comparing against the raw mods would re-enter
-    // this path (and re-dirty the screen) on every event while a sided
-    // modifier or lock key is held.
-    const binding_mods = mods.binding();
-    if (!self.mouse.mods.equal(binding_mods)) {
-        // The mouse mods only contain binding modifiers since we don't
-        // want caps/num lock or sided modifiers to affect the mouse.
-        self.mouse.mods = binding_mods;
+    // The mouse mods only contain binding modifiers since we don't
+    // want caps/num lock or sided modifiers to affect the mouse, so
+    // we compare binding mods too. Otherwise every key press with
+    // num lock on would look like a mods change.
+    if (!self.mouse.mods.equal(mods.binding())) {
+        self.mouse.mods = mods.binding();
 
         // We also need to update the renderer so it knows if it should
         // highlight links. Additionally, mark the screen as dirty so
@@ -3117,10 +3114,8 @@ pub fn keyCallback(
     }
 
     // If our mouse modifiers change we may need to change our
-    // link highlight state. Compare binding mods: stored mouse mods are
-    // binding-only, so raw key mods carrying sided modifier bits (e.g.
-    // right Option for macos-option-as-alt) would otherwise re-trigger
-    // this on every keypress while such a modifier is held.
+    // link highlight state. The mouse mods are binding mods only,
+    // see modsChanged.
     if (!self.mouse.mods.equal(event.mods.binding())) mouse_mods: {
         // Update our modifiers, this will update mouse mods too
         self.modsChanged(event.mods);
